@@ -1,0 +1,8 @@
+{
+  "share_shift_threshold_pp": 5,
+  "scene_gmv_threshold": 0.10,
+  "channel_shift_threshold_pp": 8,
+  "wording_whitelist": ["呈现", "侧重", "聚焦", "集中"],
+  "wording_blacklist": ["战略", "证明", "决心", "表明", "必然"]
+}
+
