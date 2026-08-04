@@ -6,8 +6,27 @@ Current pilot scope:
 
 - Import `sku_all.parquet` into MySQL table `sku_sales`.
 - Import `kol_all.parquet` into MySQL table `kol_live_sales`.
+- Clean monthly `Search Report.xlsx` data and load it into MySQL table
+  `ai_bot_media_search_index`.
+- Clean `Topline.xlsx`, apply overall/Xiaohongshu/Douyin BKFS labels, and load
+  media investment records into `ai_bot_media_topline_investment`.
+- Stream large annual KSI workbooks into lightweight Parquet files and load
+  KOL cost/performance data into `ai_bot_media_ksi_performance`.
 - Keep all new code under this folder and leave the previous project files untouched.
 - Run the v3 bot from `bot/`, using MySQL + Tool + Skill + Formatter architecture.
+
+Search data cleaning, field definitions, monthly refresh instructions, and Tool
+query constraints are documented in
+[`docs/search_data_pipeline.md`](docs/search_data_pipeline.md).
+Topline field definitions, BKFS rules, upload commands, and validation queries
+are documented in
+[`docs/topline_data_pipeline.md`](docs/topline_data_pipeline.md).
+KSI field compatibility, lightweight transfer, dynamic CPE, monthly refresh,
+and MySQL validation are documented in
+[`docs/ksi_data_pipeline.md`](docs/ksi_data_pipeline.md).
+BET media report routing, period rules, Tool contracts, formulas, and runtime
+checks are documented in
+[`docs/media_analysis_runtime.md`](docs/media_analysis_runtime.md).
 
 ## Server Directory
 
@@ -69,7 +88,7 @@ FEISHU_APP_SECRET=your-feishu-app-secret
 DASHSCOPE_API_KEY=your-dashscope-api-key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 DASHSCOPE_MODEL=qwen-plus
-DASHSCOPE_ROUTER_MODEL=qwen-turbo
+DASHSCOPE_ROUTER_MODEL=qwen3.7-plus
 DASHSCOPE_SUMMARY_MODEL=qwen-plus-latest
 ```
 
@@ -148,3 +167,10 @@ bot/
 ├── data/
 └── db/
 ```
+
+## Follow-up Skills V2
+
+The executable follow-up architecture and rollout switches are documented in
+[`docs/followup_skills_v2.md`](docs/followup_skills_v2.md). Default EC and BET
+report chains remain separate; only narrow follow-up and data-organization
+requests enter the V2 planner and whitelisted tools.

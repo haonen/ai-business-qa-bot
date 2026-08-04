@@ -1,0 +1,4 @@
+interface:
+  display_name: "Data Organizer"
+  short_description: "Organize EC and BET metrics into evidence tables"
+  default_prompt: "Use $data-organizer to organize the requested EC or BET metrics."

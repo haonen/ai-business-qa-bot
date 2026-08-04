@@ -143,12 +143,22 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
         add_message(open_id, "assistant", markdown)
 
         route_type = result.get("route_type")
-        if route_type in {"default_chain"} and result.get("meta", {}).get("brand"):
+        if (
+            route_type in {"default_chain", "media_analysis", "skill_dispatch"}
+            and result.get("meta", {}).get("brand")
+            and result.get("meta", {}).get("document_ready", True)
+        ):
             import bot.feishu_doc as feishu_doc
 
             brand = result["meta"].get("brand")
             period = result["meta"].get("period")
-            doc_title = f"{brand} {period} 生意分析报告"
+            if route_type == "skill_dispatch":
+                doc_title = result["meta"].get("document_title") or f"{brand} {period} 数据分析"
+            elif route_type == "media_analysis":
+                period_title = result["meta"].get("period_display") or period
+                doc_title = f"{brand} {period_title} BET媒体投资分析报告"
+            else:
+                doc_title = f"{brand} {period} 生意分析报告"
             on_progress("正在生成分析报告文档…")
             doc_url = feishu_doc.create_feishu_doc(cli, doc_title, markdown)
             _update_text(placeholder_id, f"已生成「{doc_title}」分析报告：{doc_url}")

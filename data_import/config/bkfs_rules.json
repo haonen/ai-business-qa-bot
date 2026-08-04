@@ -1,0 +1,38 @@
+{
+  "priority": ["ait_roe", "standard_ad_format"],
+  "overall": {
+    "platform_contains": [],
+    "ait_roe": {
+      "Influencer": "K",
+      "Transaction": "T"
+    },
+    "standard_ad_format_contains": {
+      "B": ["Brandzone", "Opening", "Banner"],
+      "F": ["Feeds"],
+      "S": ["Search"]
+    }
+  },
+  "xiaohongshu": {
+    "platform_contains": ["小红书"],
+    "ait_roe": {
+      "Influencer": "K"
+    },
+    "standard_ad_format_contains": {
+      "B": ["Brandzone", "Opening"],
+      "F": ["Feeds"],
+      "S": ["Search"]
+    }
+  },
+  "douyin": {
+    "platform_contains": ["抖音"],
+    "ait_roe": {
+      "Influencer": "K",
+      "Transaction": "T"
+    },
+    "standard_ad_format_contains": {
+      "B": ["Brandzone", "Banner"],
+      "F": ["Feeds"],
+      "S": ["Search"]
+    }
+  }
+}

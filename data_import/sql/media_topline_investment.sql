@@ -1,0 +1,53 @@
+CREATE TABLE IF NOT EXISTS ai_bot_media_topline_investment (
+    record_key CHAR(64) NOT NULL,
+    period_month DATE NOT NULL,
+    year SMALLINT NOT NULL,
+    month TINYINT UNSIGNED NOT NULL,
+    category VARCHAR(255) NOT NULL,
+    brand_r VARCHAR(255) NOT NULL,
+    universe VARCHAR(255) NOT NULL,
+    luxe_brands VARCHAR(255) NULL,
+    division_for_loreal VARCHAR(255) NULL,
+    cate VARCHAR(255) NULL,
+    cate_1 VARCHAR(255) NULL,
+    cate_2 VARCHAR(255) NULL,
+    top_15_group VARCHAR(255) NOT NULL,
+    group_type VARCHAR(255) NOT NULL,
+    media VARCHAR(255) NOT NULL,
+    key_competitors VARCHAR(255) NOT NULL,
+    submedia VARCHAR(255) NOT NULL,
+    sponsor_type VARCHAR(255) NULL,
+    spend_million DECIMAL(20,6) NOT NULL,
+    spend_wo_vat_million DECIMAL(20,6) NOT NULL,
+    standard_app_name VARCHAR(255) NULL,
+    standard_ad_format VARCHAR(255) NULL,
+    ait_roe VARCHAR(100) NOT NULL,
+    bkfs_overall CHAR(1) NULL,
+    bkfs_xiaohongshu CHAR(1) NULL,
+    bkfs_douyin CHAR(1) NULL,
+    source_file VARCHAR(255) NOT NULL,
+    source_sheet VARCHAR(100) NOT NULL,
+    source_row_number INT UNSIGNED NOT NULL,
+    import_batch_id VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (record_key),
+    INDEX idx_topline_period_brand (period_month, brand_r),
+    INDEX idx_topline_brand_period (brand_r, period_month),
+    INDEX idx_topline_category_period (category, period_month),
+    INDEX idx_topline_media_period (media, submedia, period_month),
+    INDEX idx_topline_overall_period (bkfs_overall, period_month),
+    INDEX idx_topline_xhs_period (bkfs_xiaohongshu, period_month),
+    INDEX idx_topline_douyin_period (bkfs_douyin, period_month),
+    INDEX idx_topline_app_period (standard_app_name, period_month),
+    CONSTRAINT chk_topline_month CHECK (month BETWEEN 1 AND 12),
+    CONSTRAINT chk_topline_overall CHECK (
+        bkfs_overall IS NULL OR bkfs_overall IN ('B', 'K', 'F', 'S', 'T')
+    ),
+    CONSTRAINT chk_topline_xhs CHECK (
+        bkfs_xiaohongshu IS NULL OR bkfs_xiaohongshu IN ('B', 'K', 'F', 'S')
+    ),
+    CONSTRAINT chk_topline_douyin CHECK (
+        bkfs_douyin IS NULL OR bkfs_douyin IN ('B', 'K', 'F', 'S', 'T')
+    )
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

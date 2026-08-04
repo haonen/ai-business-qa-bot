@@ -13,6 +13,7 @@ SKILL_FILES = {
     "sku_investigation": "sku_investigation.md",
     "reverse_drill": "reverse_drill.md",
     "playbook_read": "playbook_read.md",
+    "media_analysis": "media_analysis.md",
 }
 
 
@@ -51,4 +52,3 @@ Skill方法论：
 
 请严格按Skill方法论分析。只能使用工具返回的数据，不得引入行业、竞品、大盘、消费者画像等未提供信息。
 """
-

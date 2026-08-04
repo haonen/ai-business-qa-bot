@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analysis Drill"
+  short_description: "Analyze EC and BET follow-up business questions"
+  default_prompt: "Use $analysis-drill to analyze this EC or BET follow-up question."

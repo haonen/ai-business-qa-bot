@@ -1,0 +1,46 @@
+{
+  "name": "analysis_drill",
+  "domains": ["ec", "bet", "ec_bet"],
+  "modes": ["performance", "composition", "change_attribution", "comparison", "trend_alignment"],
+  "group_by": {
+    "ec": ["month", "category", "key_driver", "series", "sku"],
+    "bet": ["month", "category", "ait", "platform", "bkfst", "kol_platform", "tier", "kol_type", "kol"],
+    "ec_bet": ["month"]
+  },
+  "metrics": {
+    "ec": ["gmv_actual", "gmv_evol", "unit_actual", "unit_evol", "atv_actual"],
+    "bet": [
+      "spend_actual", "spend_evol", "spend_weight", "spend_weight_change",
+      "nso_actual", "nso_evol", "fee_ratio", "fee_ratio_change",
+      "search_actual", "search_evol", "cost_actual", "cost_evol",
+      "cost_weight", "cost_weight_change", "engage_actual", "engage_evol", "cpe"
+    ],
+    "ec_bet": [
+      "gmv_actual", "gmv_evol", "nso_actual", "nso_evol",
+      "spend_actual", "spend_evol", "fee_ratio", "fee_ratio_change",
+      "search_actual", "search_evol", "cost_actual", "cost_evol",
+      "engage_actual", "engage_evol", "cpe"
+    ]
+  },
+  "allowed_pairs": [
+    ["month", "category"], ["month", "key_driver"],
+    ["category", "key_driver"], ["category", "series"],
+    ["key_driver", "series"], ["month", "ait"],
+    ["month", "platform"], ["month", "bkfst"],
+    ["month", "tier"], ["month", "kol_type"], ["month", "kol_platform"], ["month", "category"]
+  ],
+  "max_group_by": 2,
+  "max_rows": 50,
+  "sku_requires_filter": true,
+  "tools": [
+    "query_ec_followup_table", "query_bet_followup_table",
+    "query_change_contribution", "query_ec_bet_monthly"
+  ],
+  "insight_rules": {
+    "dominant_share": 0.7,
+    "leading_share": 0.5,
+    "series_top_n": 2,
+    "series_concentration_share": 0.6
+  },
+  "output": {"insight_bullets_min": 2, "insight_bullets_max": 3, "evidence_required": true}
+}

@@ -9,9 +9,9 @@
 3. query_scene_tag（需要场景/人群信号时）
 
 ## 分析步骤
-1. 按DrilldownContext组合筛选：brand、period、category、series、kol_driver、link_type、function_tag。
-2. Top链接只描述工具返回的GMV、unit、atv、占比和link_type。
-3. link_type分布用占比呈现，不把标题词直接上升为战略判断。
+1. 按DrilldownContext组合筛选：brand、period、category、series、key_driver、function_tag。
+2. Top链接只描述工具返回的GMV、unit、atv、占比和同比。
+3. 不把单条标题词直接上升为品牌整体策略判断。
 
 ## 结论生成三层结构（通用框架）
 L1 现状：Top链接GMV、unit、atv、占比。
@@ -20,4 +20,3 @@ L3 打法信号：需要场景标签或系列功能线双信号支撑，且必�
 
 ## 数据边界
 不能用单条标题推断品牌战略或真实人群，只能说“标题/场景词呈现”。
-

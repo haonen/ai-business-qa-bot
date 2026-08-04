@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
+import logging
 
 from bot.formatter import render_module_category, render_module_driver, render_module_drilldown, render_module_playbook
 from bot.session import SessionState
 from bot.skills.loader import build_skill_prompt, load_narrative_config
 from bot.tools import query_category, query_driver, query_scene_tag, query_series, query_sku_list
 from bot.utils import llm_client, extract_json_object
+from bot.chains.followup_v2_chain import run_followup_v2_chain
+
+
+log = logging.getLogger(__name__)
 
 
 def dispatch_skill(followup_text: str, state: SessionState) -> dict:
     ctx = state.drilldown_ctx
     prompt = f"""
 你是生意分析助手的路由模块。当前上下文：
-品牌={ctx.brand}，时间段={ctx.period}，已锁品类={ctx.category}，已锁渠道={ctx.kol_driver}
+品牌={ctx.brand}，时间段={ctx.period}，已锁品类={ctx.category}，已锁渠道={ctx.key_driver}
 
 用户追问："{followup_text}"
 
@@ -57,13 +63,32 @@ def _playbook_bullets(scene_result: dict, series_result: dict) -> str:
 def run_filter_update(state: SessionState, update: dict) -> dict:
     ctx = state.drilldown_ctx
     category = ctx.category
+    aliases = ctx.brand_aliases or ([ctx.tmall_brand] if ctx.tmall_brand else [])
     view = update.get("view")
-    if view == "driver" or update.get("kol_driver"):
-        result = query_driver(brand=ctx.brand, period=ctx.period, category=category, series=ctx.series, function_tag=ctx.function_tag)
+    if view == "driver" or update.get("key_driver"):
+        result = query_driver(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            series=ctx.series,
+            function_tag=ctx.function_tag,
+            brand_aliases=aliases,
+        )
         return {"markdown": render_module_driver(result), "meta": {"last_analysis_view": "driver"}}
     if view == "playbook":
-        scene = query_scene_tag(brand=ctx.brand, period=ctx.period, kol_driver=ctx.kol_driver, category=category)
-        series = query_series(brand=ctx.brand, period=ctx.period, category=category or "")
+        scene = query_scene_tag(
+            brand=ctx.brand,
+            period=ctx.period,
+            key_driver=ctx.key_driver,
+            category=category,
+            brand_aliases=aliases,
+        )
+        series = query_series(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category or "",
+            brand_aliases=aliases,
+        )
         return {
             "markdown": render_module_playbook({
                 "scene_tags": scene.get("scene_tags", []),
@@ -73,21 +98,65 @@ def run_filter_update(state: SessionState, update: dict) -> dict:
             "meta": {"last_analysis_view": "playbook"},
         }
     if view == "sku" or update.get("category"):
-        series = query_series(brand=ctx.brand, period=ctx.period, category=category)
-        sku = query_sku_list(brand=ctx.brand, period=ctx.period, category=category, top_n=20)
+        series = query_series(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            brand_aliases=aliases,
+        )
+        sku = query_sku_list(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            top_n=20,
+            brand_aliases=aliases,
+        )
         sku["product_lines"] = series.get("series", [])
         return {
             "markdown": render_module_drilldown(sku, category, ""),
             "meta": {"last_analysis_view": "category_drilldown", "category": category},
         }
-    result = query_category(brand=ctx.brand, period=ctx.period, kol_driver=ctx.kol_driver, link_type=ctx.link_type, series=ctx.series, function_tag=ctx.function_tag)
+    result = query_category(
+        brand=ctx.brand,
+        period=ctx.period,
+        key_driver=ctx.key_driver,
+        series=ctx.series,
+        function_tag=ctx.function_tag,
+        brand_aliases=aliases,
+    )
     return {"markdown": render_module_category(result, category or ""), "meta": {"last_analysis_view": "category"}}
 
 
-def run_skill_chain(followup_text: str, state: SessionState) -> dict:
+def run_skill_chain(
+    followup_text: str,
+    state: SessionState,
+    *,
+    brand: str | None = None,
+    period: str | None = None,
+    brand_aliases: list[str] | None = None,
+) -> dict:
+    v2_enabled = os.environ.get("FOLLOWUP_SKILL_V2_ENABLED", "1") == "1"
+    shadow_enabled = os.environ.get("FOLLOWUP_SKILL_V2_SHADOW", "0") == "1"
+    if v2_enabled:
+        return run_followup_v2_chain(
+            followup_text,
+            state,
+            brand=brand,
+            period=period,
+            brand_aliases=brand_aliases,
+        )
+    if shadow_enabled:
+        try:
+            shadow = run_followup_v2_chain(
+                followup_text, state, brand=brand, period=period,
+                brand_aliases=brand_aliases,
+            )
+            log.info("[followup_v2_shadow] meta=%s", shadow.get("meta"))
+        except Exception as exc:
+            log.warning("[followup_v2_shadow] failed: %s", exc)
     ctx = state.drilldown_ctx
     if not ctx.brand or not ctx.period:
-        return {"markdown": "我需要先知道品牌和时间段。可以先问：某品牌618怎么样。", "meta": {}}
+        return {"markdown": "我需要先知道品牌和时间段。可以先问：某品牌2026年6月怎么样。", "meta": {}}
     decision = dispatch_skill(followup_text, state)
     skill = decision.get("skill")
     if decision.get("confidence") == "low" and skill == "unsupported":
@@ -98,12 +167,24 @@ def run_skill_chain(followup_text: str, state: SessionState) -> dict:
         build_skill_prompt(skill, {"ctx": ctx.__dict__}, followup_text)
 
     category = ctx.category
+    aliases = ctx.brand_aliases or ([ctx.tmall_brand] if ctx.tmall_brand else [])
     if not category and state.last_result_cache:
         category = state.last_result_cache.get("selected_category") or state.last_result_cache.get("category")
 
     if skill == "playbook_read":
-        scene = query_scene_tag(brand=ctx.brand, period=ctx.period, kol_driver=ctx.kol_driver, category=category)
-        series = query_series(brand=ctx.brand, period=ctx.period, category=category or "")
+        scene = query_scene_tag(
+            brand=ctx.brand,
+            period=ctx.period,
+            key_driver=ctx.key_driver,
+            category=category,
+            brand_aliases=aliases,
+        )
+        series = query_series(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category or "",
+            brand_aliases=aliases,
+        )
         return {
             "markdown": render_module_playbook({
                 "scene_tags": scene.get("scene_tags", []),
@@ -115,23 +196,64 @@ def run_skill_chain(followup_text: str, state: SessionState) -> dict:
 
     if skill == "attribution_lite":
         if not category:
-            cat = query_category(brand=ctx.brand, period=ctx.period)
+            cat = query_category(
+                brand=ctx.brand,
+                period=ctx.period,
+                brand_aliases=aliases,
+            )
             category = (cat.get("categories") or [{}])[0].get("category_cn")
-        series = query_series(brand=ctx.brand, period=ctx.period, category=category)
-        sku = query_sku_list(brand=ctx.brand, period=ctx.period, category=category, top_n=10)
+        series = query_series(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            brand_aliases=aliases,
+        )
+        sku = query_sku_list(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            top_n=10,
+            brand_aliases=aliases,
+        )
         sku["product_lines"] = series.get("series", [])
         note = "\n\n_以上为系列级拆解。链接级的年度归因（具体哪条链接带来变化）当前数据暂不支持。_"
         return {"markdown": render_module_drilldown(sku, category, "") + note, "meta": {"last_analysis_view": "attribution_lite"}}
 
     if skill == "key_driver":
-        result = query_driver(brand=ctx.brand, period=ctx.period, category=category)
+        result = query_driver(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            brand_aliases=aliases,
+        )
         return {"markdown": render_module_driver(result), "meta": {"last_analysis_view": "driver"}}
 
     if skill == "sku_investigation":
-        sku = query_sku_list(brand=ctx.brand, period=ctx.period, category=category, kol_driver=ctx.kol_driver, series=ctx.series, function_tag=ctx.function_tag, top_n=20)
-        series = query_series(brand=ctx.brand, period=ctx.period, category=category or sku.get("category") or "")
+        sku = query_sku_list(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category,
+            key_driver=ctx.key_driver,
+            series=ctx.series,
+            function_tag=ctx.function_tag,
+            top_n=20,
+            brand_aliases=aliases,
+        )
+        series = query_series(
+            brand=ctx.brand,
+            period=ctx.period,
+            category=category or sku.get("category") or "",
+            brand_aliases=aliases,
+        )
         sku["product_lines"] = series.get("series", [])
         return {"markdown": render_module_drilldown(sku, category or "", ""), "meta": {"last_analysis_view": "sku"}}
 
-    cat = query_category(brand=ctx.brand, period=ctx.period, kol_driver=ctx.kol_driver, link_type=ctx.link_type, series=ctx.series, function_tag=ctx.function_tag)
+    cat = query_category(
+        brand=ctx.brand,
+        period=ctx.period,
+        key_driver=ctx.key_driver,
+        series=ctx.series,
+        function_tag=ctx.function_tag,
+        brand_aliases=aliases,
+    )
     return {"markdown": render_module_category(cat, category or ""), "meta": {"last_analysis_view": "category"}}

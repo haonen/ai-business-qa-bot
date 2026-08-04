@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from bot.tools.common import combine_two_years, filter_kol, filter_sku, split_years, tool
-from bot.utils import safe_div
-from bot.tools.query_series import _infer_series_from_title, _llm_series_fallback, _series_keywords_for_brand
+from bot.tools.common import combine_periods, filter_sku, split_periods, tool
+from bot.tools.query_series import (
+    _infer_series_from_title,
+    _llm_series_fallback,
+    _series_keywords_for_brand,
+)
+from bot.utils import safe_div, safe_evol
 
 
 @tool
@@ -10,140 +14,144 @@ def query_driver(
     brand: str,
     period: str,
     category: str | None = None,
-    link_type: str | None = None,
     series: str | None = None,
     function_tag: str | None = None,
+    brand_aliases: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
-    """三渠道拆分，两年对比，并附情报通直播参考。"""
+    """按key_driver动态拆分渠道，并返回各渠道系列和Top SKU。"""
     try:
-        df = filter_sku(brand, period, category=category, link_type=link_type, series=series, function_tag=function_tag)
+        df = filter_sku(
+            brand,
+            period,
+            category=category,
+            series=series,
+            function_tag=function_tag,
+            brand_aliases=brand_aliases,
+        )
         if df.empty:
             return {"error": "no_data", "message": "指定条件下无SKU数据"}
-        df25, df26 = split_years(df, "bus_date", period)
-        rows, total = combine_two_years(df25, df26, ["kol_driver"])
-        by_driver = {r["kol_driver"]: r for r in rows}
-        drivers = [by_driver.get(name, {
-            "kol_driver": name, "gmv_2026": 0, "gmv_2025": 0, "unit_2026": 0,
-            "unit_2025": 0, "atv_2026": None, "atv_2025": None, "weight": 0,
-            "evol": None, "share_delta": None, "gmv_diff": 0,
-        }) for name in ["Non-KOL", "T2", "李佳琦"]]
+        context = dict(df.attrs.get("ec_context") or {})
+        prior_df, current_df = split_periods(df, "bus_date")
+        rows, total = combine_periods(prior_df, current_df, ["key_driver"])
+        drivers = sorted(rows, key=lambda row: row.get("gmv_current") or 0, reverse=True)
 
-        low_coverage = not _series_keywords_for_brand(brand)
+        analysis_brand = context.get("input_brand", brand)
+        low_coverage = not _series_keywords_for_brand(analysis_brand)
         llm_candidates = _llm_series_fallback(
-            brand,
-            df26.sort_values("gmv", ascending=False)["product_title"].dropna().head(50).tolist(),
+            analysis_brand,
+            current_df.sort_values("gmv", ascending=False)["product_title"].dropna().head(50).tolist(),
         ) if low_coverage else []
 
         driver_top_skus = []
-        for driver_name in ["李佳琦", "T2", "Non-KOL"]:
-            d26 = df26[df26["kol_driver"] == driver_name]
-            d25 = df25[df25["kol_driver"] == driver_name]
-            total_driver_26 = float(d26["gmv"].sum()) if not d26.empty else 0.0
-            total_driver_25 = float(d25["gmv"].sum()) if not d25.empty else 0.0
-            if total_driver_26 <= 0:
+        for driver in drivers:
+            driver_name = driver.get("key_driver") or "其他"
+            current_driver = current_df[current_df["key_driver"].fillna("其他") == driver_name]
+            prior_driver = prior_df[prior_df["key_driver"].fillna("其他") == driver_name]
+            total_current = float(current_driver["gmv"].sum()) if not current_driver.empty else 0.0
+            total_prior = float(prior_driver["gmv"].sum()) if not prior_driver.empty else 0.0
+            if total_current <= 0:
                 continue
 
-            buckets = {}
-            for year, frame in [(2025, d25), (2026, d26)]:
+            buckets: dict[str, dict] = {}
+            for suffix, frame in (("prior", prior_driver), ("current", current_driver)):
                 for _, row in frame.iterrows():
-                    series_name, function_tag, source = _infer_series_from_title(row.get("product_title"), brand, llm_candidates)
-                    if series_name not in buckets:
-                        buckets[series_name] = {
-                            "product_line": series_name,
-                            "series": series_name,
-                            "function_tag": function_tag,
-                            "source": source,
-                            "gmv_2026": 0.0,
-                            "gmv_2025": 0.0,
-                            "unit_2026": 0.0,
-                            "unit_2025": 0.0,
-                            "item_ids": set(),
-                        }
-                    buckets[series_name][f"gmv_{year}"] += float(row.get("gmv") or 0)
-                    buckets[series_name][f"unit_{year}"] += float(row.get("unit") or 0)
-                    if year == 2026:
-                        buckets[series_name]["item_ids"].add(str(row.get("item_id")))
+                    product_line, tag, source = _infer_series_from_title(
+                        row.get("product_title"),
+                        analysis_brand,
+                        llm_candidates,
+                    )
+                    item = buckets.setdefault(product_line, {
+                        "product_line": product_line,
+                        "series": product_line,
+                        "function_tag": tag,
+                        "source": source,
+                        "gmv_current": 0.0,
+                        "gmv_prior": 0.0,
+                        "unit_current": 0.0,
+                        "unit_prior": 0.0,
+                        "item_ids": set(),
+                    })
+                    item[f"gmv_{suffix}"] += float(row.get("gmv") or 0)
+                    item[f"unit_{suffix}"] += float(row.get("unit") or 0)
+                    if suffix == "current":
+                        item["item_ids"].add(str(row.get("item_id")))
 
             product_lines = []
             for item in buckets.values():
-                g26 = item["gmv_2026"]
-                g25 = item["gmv_2025"]
-                u26 = item["unit_2026"]
-                item["gmv_2026"] = round(g26)
-                item["gmv_2025"] = round(g25)
-                item["unit_2026"] = round(u26)
-                item["unit_2025"] = round(item["unit_2025"])
-                item["atv_2026"] = round(g26 / u26, 2) if u26 else None
-                item["weight"] = safe_div(g26, total_driver_26)
-                item["share_delta"] = None if not total_driver_26 or not total_driver_25 else round(g26 / total_driver_26 - g25 / total_driver_25, 4)
-                item["evol"] = None if not g25 else round((g26 - g25) / g25, 4)
-                item["item_ids"] = sorted(item["item_ids"])
+                g_current = item["gmv_current"]
+                g_prior = item["gmv_prior"]
+                u_current = item["unit_current"]
+                item.update({
+                    "gmv_current": round(g_current),
+                    "gmv_prior": round(g_prior),
+                    "unit_current": round(u_current),
+                    "unit_prior": round(item["unit_prior"]),
+                    "atv_current": round(g_current / u_current, 2) if u_current else None,
+                    "weight": safe_div(g_current, total_current),
+                    "evol": safe_evol(g_current, g_prior),
+                    "share_delta": (
+                        round(g_current / total_current - g_prior / total_prior, 4)
+                        if total_current and total_prior else None
+                    ),
+                    "item_ids": sorted(item["item_ids"]),
+                })
                 product_lines.append(item)
 
-            top_skus = []
-            if not d26.empty:
-                sku26 = d26.groupby("item_id", dropna=False).agg(
-                    gmv_2026=("gmv", "sum"),
+            sku_agg = (
+                current_driver.groupby("item_id", dropna=False)
+                .agg(
+                    gmv_current=("gmv", "sum"),
                     unit=("unit", "sum"),
                     product_title=("product_title", "first"),
                     category_cn=("category_cn", "first"),
-                    link_type=("link_type", "first"),
-                ).sort_values("gmv_2026", ascending=False).head(10).reset_index()
-                for _, row in sku26.iterrows():
-                    gmv = float(row["gmv_2026"] or 0)
-                    unit = float(row["unit"] or 0)
-                    top_skus.append({
-                        "item_id": str(row["item_id"]),
-                        "product_title": row["product_title"],
-                        "category_cn": row["category_cn"],
-                        "link_type": row["link_type"],
-                        "kol_driver": driver_name,
-                        "gmv_2026": round(gmv),
-                        "weight": safe_div(gmv, total_driver_26),
-                        "unit": round(unit),
-                        "atv": round(gmv / unit, 2) if unit else None,
-                    })
+                )
+                .sort_values("gmv_current", ascending=False)
+                .head(10)
+                .reset_index()
+            )
+            top_skus = []
+            for _, row in sku_agg.iterrows():
+                gmv = float(row["gmv_current"] or 0)
+                unit = float(row["unit"] or 0)
+                top_skus.append({
+                    "item_id": str(row["item_id"]),
+                    "product_title": row["product_title"],
+                    "category_cn": row["category_cn"],
+                    "key_driver": driver_name,
+                    "gmv_current": round(gmv),
+                    "weight": safe_div(gmv, total_current),
+                    "unit": round(unit),
+                    "atv": round(gmv / unit, 2) if unit else None,
+                })
 
             driver_top_skus.append({
-                "kol_driver": driver_name,
-                "total_gmv_2026": round(total_driver_26),
-                "total_gmv_2025": round(total_driver_25),
-                "product_lines": sorted(product_lines, key=lambda x: x["gmv_2026"], reverse=True),
+                "key_driver": driver_name,
+                "total_gmv_current": round(total_current),
+                "total_gmv_prior": round(total_prior),
+                "product_lines": sorted(
+                    product_lines,
+                    key=lambda item: item.get("gmv_current") or 0,
+                    reverse=True,
+                ),
                 "top_skus": top_skus,
             })
 
-        kol = filter_kol(brand, period)
-        live_reference = {"note": "以下数据来自情报通，仅含直播渠道", "breakdown": []}
-        if not kol.empty:
-            _, kol26 = split_years(kol, "live_start_date", period)
-            total_live = float(kol26["live_sales_amount"].sum()) if not kol26.empty else 0
-            live_reference["ttl_live_gmv_2026"] = round(total_live)
-            for kt in ["李佳琦", "T2", "店播"]:
-                val = float(kol26.loc[kol26["kol_type"] == kt, "live_sales_amount"].sum())
-                unit = float(kol26.loc[kol26["kol_type"] == kt, "live_sales_unit"].sum())
-                live_reference["breakdown"].append({
-                    "kol_type": kt,
-                    "gmv_2026": round(val),
-                    "unit_2026": round(unit),
-                    "atv_2026": round(val / unit, 2) if unit else None,
-                    "of_ttl_live": safe_div(val, total_live),
-                })
-
         return {
-            "brand": brand,
+            "brand": context.get("input_brand", brand),
+            "input_brand": brand,
+            "source_brand": context.get("source_brand"),
             "period": period,
+            "period_meta": context,
             "category": category,
-            "link_type": link_type,
             "series": series,
             "function_tag": function_tag,
             "driver_summary": {
-                "total_gmv_2026": total["gmv_2026"],
-                "total_gmv_2025": total["gmv_2025"],
-                "total_unit_2026": total["unit_2026"],
-                "total_unit_2025": total["unit_2025"],
+                "total_gmv_current": total["gmv_current"],
+                "total_gmv_prior": total["gmv_prior"],
+                "total_unit_current": total["unit_current"],
+                "total_unit_prior": total["unit_prior"],
                 "drivers": drivers,
             },
-            "live_reference": live_reference,
             "driver_top_skus": driver_top_skus,
         }
     except Exception as exc:

@@ -36,12 +36,19 @@ from lark_oapi.api.drive.v1 import (
 
 # ── Block builders ────────────────────────────────────────────────────────────
 
-def _run(content: str, bold: bool = False, italic: bool = False) -> TextRun:
+def _run(
+    content: str,
+    bold: bool = False,
+    italic: bool = False,
+    text_color: int | None = None,
+) -> TextRun:
     style = TextElementStyle.builder()
     if bold:
         style = style.bold(True)
     if italic:
         style = style.italic(True)
+    if text_color is not None:
+        style = style.text_color(text_color)
     return TextRun.builder().content(str(content)).text_element_style(style.build()).build()
 
 
@@ -50,8 +57,15 @@ def _make_text(runs: list) -> Text:
     return Text.builder().elements(elements).build()
 
 
-def _para(content: str, bold: bool = False, italic: bool = False) -> Block:
-    return Block.builder().block_type(2).text(_make_text([_run(content, bold=bold, italic=italic)])).build()
+def _para(
+    content: str,
+    bold: bool = False,
+    italic: bool = False,
+    text_color: int | None = None,
+) -> Block:
+    return Block.builder().block_type(2).text(
+        _make_text([_run(content, bold=bold, italic=italic, text_color=text_color)])
+    ).build()
 
 
 def _heading(content: str) -> Block:
@@ -138,7 +152,7 @@ def _write_sheet_values(client: lark.Client, spreadsheet_token: str, sheet_id: s
     )
 
 
-def _compact_wide_table(headers: list, rows: list, max_cols: int = 8) -> tuple[list, list]:
+def _compact_wide_table(headers: list, rows: list, max_cols: int = 9) -> tuple[list, list]:
     """
     Embedded doc sheets are more reliable with compact tables. If a table is
     wider than max_cols, merge trailing metric columns instead of falling back
@@ -416,10 +430,14 @@ def _parse_table_lines(table_lines: list[str]) -> _TableSpec | None:
     headers: list = []
     rows: list = []
     for tl in table_lines:
-        line = tl.strip()
+        # Preserve full-width indentation in the first cell. Only remove the
+        # ASCII whitespace Markdown itself may add around a table row.
+        line = tl.strip(" \t")
         if not line or _is_table_separator(line):
             continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
+        # Only trim ASCII padding added by Markdown table renderers. Preserve
+        # full-width spaces (U+3000), which are used for business hierarchy.
+        cells = [c.strip(" \t") for c in line.strip("|").split("|")]
         if not headers:
             headers = cells
         else:
@@ -474,11 +492,18 @@ def markdown_to_items(content: str) -> list:
         if _looks_like_table_start(lines, i):
             table_lines = []
             while i < len(lines) and "|" in lines[i].strip():
-                table_lines.append(lines[i].strip())
+                # Full-width spaces carry the TTL > AIT > platform hierarchy.
+                table_lines.append(lines[i].strip(" \t"))
                 i += 1
             table = _parse_table_lines(table_lines)
             if table:
                 items.append(table)
+            continue
+
+        # Subtle note: > _text_. FontColor=7 is gray in Feishu Docx.
+        if s.startswith("> _") and s.endswith("_") and len(s) > 4:
+            items.append(_para(s[3:-1], italic=True, text_color=7))
+            i += 1
             continue
 
         # Italic paragraph: _text_

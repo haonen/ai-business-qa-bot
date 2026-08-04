@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bot.tools.common import combine_two_years, filter_sku, split_years, tool
+from bot.tools.common import combine_periods, filter_sku, split_periods, tool
 
 
 @tool
@@ -11,12 +11,11 @@ def query_compare(
     period_b: str | None = None,
     dimension: str = "category",
 ) -> dict:
-    """跨品牌/跨时段对比。dimension支持category/driver/link_type。"""
+    """跨品牌/跨时段对比。dimension支持category/driver。"""
     try:
         group_map = {
             "category": ["category_cn"],
-            "driver": ["kol_driver"],
-            "link_type": ["link_type"],
+            "driver": ["key_driver"],
         }
         group_cols = group_map.get(dimension, ["category_cn"])
 
@@ -24,9 +23,16 @@ def query_compare(
             df = filter_sku(brand, period)
             if df.empty:
                 return {"label": label, "brand": brand, "period": period, "rows": [], "total": {}}
-            df25, df26 = split_years(df, "bus_date", period)
-            rows, total = combine_two_years(df25, df26, group_cols)
-            return {"label": label, "brand": brand, "period": period, "rows": rows, "total": total}
+            prior_df, current_df = split_periods(df, "bus_date")
+            rows, total = combine_periods(prior_df, current_df, group_cols)
+            return {
+                "label": label,
+                "brand": df.attrs.get("ec_context", {}).get("source_brand", brand),
+                "period": period,
+                "period_meta": df.attrs.get("ec_context", {}),
+                "rows": rows,
+                "total": total,
+            }
 
         return {
             "dimension": dimension,
@@ -35,4 +41,3 @@ def query_compare(
         }
     except Exception as exc:
         return {"error": "execution_error", "message": str(exc)}
-

@@ -14,6 +14,7 @@ __pycache__/
 data_import/data/*.parquet
 data_import/data/*.csv
 data_import/data/*.xlsx
+data_import/output/
 
 # Operational access notes may contain server or database credentials.
 docs/*access*.md

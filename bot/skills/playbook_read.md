@@ -6,7 +6,7 @@
 ## 必须调用的工具
 1. query_scene_tag
 2. query_series
-3. query_sku_list（可选，用于查看Top链接标题和link_type）
+3. query_sku_list（可选，用于查看Top链接标题）
 
 ## 分析步骤
 1. query_scene_tag获取场景标签GMV、unit、weight和link_count。
@@ -24,4 +24,3 @@ L3 打法信号：只有当场景标签GMV占比超过narrative_config.json阈�
 
 ## 数据边界
 不能推断真实消费者画像。只能说“标题/场景词呈现礼赠、520、尾款、新客等信号”。
-

@@ -4,7 +4,7 @@ import json
 import re
 from collections import defaultdict
 
-from bot.tools.common import filter_sku, load_function_tags, load_series_map, match_function_tag, split_years, tool
+from bot.tools.common import filter_sku, load_function_tags, load_series_map, match_function_tag, split_periods, tool
 from bot.utils import llm_client, safe_div, safe_evol
 
 
@@ -73,67 +73,77 @@ def query_series(
     brand: str,
     period: str,
     category: str,
-    kol_driver: str | None = None,
-    link_type: str | None = None,
+    key_driver: str | None = None,
+    brand_aliases: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """系列分布，优先码表，兜底标题规则/LLM归纳。"""
     try:
-        df = filter_sku(brand, period, category=category, kol_driver=kol_driver, link_type=link_type)
+        df = filter_sku(
+            brand,
+            period,
+            category=category,
+            key_driver=key_driver,
+            brand_aliases=brand_aliases,
+        )
         if df.empty:
             return {"error": "no_data", "message": "指定条件下无SKU数据"}
-        df25, df26 = split_years(df, "bus_date", period)
-        total_26 = float(df26["gmv"].sum()) if not df26.empty else 0.0
-        total_25 = float(df25["gmv"].sum()) if not df25.empty else 0.0
+        context = dict(df.attrs.get("ec_context") or {})
+        prior_df, current_df = split_periods(df, "bus_date")
+        total_current = float(current_df["gmv"].sum()) if not current_df.empty else 0.0
+        total_prior = float(prior_df["gmv"].sum()) if not prior_df.empty else 0.0
 
         low_coverage = not _series_keywords_for_brand(brand)
         llm_candidates = _llm_series_fallback(
             brand,
-            df26.sort_values("gmv", ascending=False)["product_title"].dropna().head(50).tolist(),
+            current_df.sort_values("gmv", ascending=False)["product_title"].dropna().head(50).tolist(),
         ) if low_coverage else []
 
         bucket: dict[str, dict] = defaultdict(lambda: {
-            "series": "", "function_tag": None, "source": "", "gmv_2026": 0.0,
-            "gmv_2025": 0.0, "unit_2026": 0.0, "unit_2025": 0.0, "link_count": 0,
+            "series": "", "function_tag": None, "source": "",
+            "gmv_current": 0.0, "gmv_prior": 0.0,
+            "unit_current": 0.0, "unit_prior": 0.0, "link_count": 0,
         })
-        for year, frame in [(2025, df25), (2026, df26)]:
+        for suffix, frame in [("prior", prior_df), ("current", current_df)]:
             for _, row in frame.iterrows():
                 series, function_tag, source = _infer_series_from_title(row.get("product_title"), brand, llm_candidates)
                 b = bucket[series]
                 b["series"] = series
                 b["function_tag"] = b["function_tag"] or function_tag
                 b["source"] = b["source"] or source
-                b[f"gmv_{year}"] += float(row.get("gmv") or 0)
-                b[f"unit_{year}"] += float(row.get("unit") or 0)
-                if year == 2026:
+                b[f"gmv_{suffix}"] += float(row.get("gmv") or 0)
+                b[f"unit_{suffix}"] += float(row.get("unit") or 0)
+                if suffix == "current":
                     b["link_count"] += 1
 
         rows = []
         for item in bucket.values():
-            g26, g25 = item["gmv_2026"], item["gmv_2025"]
-            u26, u25 = item["unit_2026"], item["unit_2025"]
+            g_current, g_prior = item["gmv_current"], item["gmv_prior"]
+            u_current, u_prior = item["unit_current"], item["unit_prior"]
             rows.append({
                 "product_line": item["series"],
                 "series": item["series"],
                 "function_tag": item["function_tag"],
                 "source": item["source"],
-                "gmv_2026": round(g26),
-                "gmv_2025": round(g25),
-                "unit_2026": round(u26),
-                "unit_2025": round(u25),
-                "atv_2026": round(g26 / u26, 2) if u26 else None,
-                "atv_2025": round(g25 / u25, 2) if u25 else None,
-                "weight": safe_div(g26, total_26),
-                "evol": safe_evol(g26, g25),
-                "share_delta": None if not total_26 or not total_25 else round(g26 / total_26 - g25 / total_25, 4),
+                "gmv_current": round(g_current),
+                "gmv_prior": round(g_prior),
+                "unit_current": round(u_current),
+                "unit_prior": round(u_prior),
+                "atv_current": round(g_current / u_current, 2) if u_current else None,
+                "atv_prior": round(g_prior / u_prior, 2) if u_prior else None,
+                "weight": safe_div(g_current, total_current),
+                "evol": safe_evol(g_current, g_prior),
+                "share_delta": None if not total_current or not total_prior else round(g_current / total_current - g_prior / total_prior, 4),
                 "link_count": item["link_count"],
             })
-        rows = sorted(rows, key=lambda x: x["gmv_2026"], reverse=True)
+        rows = sorted(rows, key=lambda x: x["gmv_current"], reverse=True)
         return {
-            "brand": brand,
+            "brand": context.get("input_brand", brand),
+            "input_brand": brand,
+            "source_brand": context.get("source_brand"),
             "period": period,
+            "period_meta": context,
             "category": category,
-            "kol_driver": kol_driver,
-            "link_type": link_type,
+            "key_driver": key_driver,
             "series": rows,
             "product_lines": rows,
             "llm_candidates": llm_candidates,
