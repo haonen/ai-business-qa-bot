@@ -10,6 +10,7 @@ from bot.session import SessionState
 from bot.media_period import normalize_media_period_hint
 from bot.utils import detect_brand_hint, extract_json_object, llm_client, normalize_period_hint
 from bot.followup_plan import is_narrow_followup
+from bot.market_plan import build_market_plan, is_market_question
 
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ MEDIA_HINTS = [
     "社交搜索", "搜索指数", "媒体表现", "小红书投放", "抖音投放",
     "小红书花费", "抖音花费", "ksi", "kol performance", "kol表现", "kol花费",
     "达人投放", "达人花费", "engage", "cpe",
+    "take rate", "take-rate", "take_rate", "bet%",
 ]
 
 
@@ -57,6 +59,11 @@ class RouteResult:
     brand_aliases: list[str] | None = None
     media_scope: str | None = None
     followup_text: str | None = None
+    segment: str | None = None
+    platform: str | None = None
+    market_view: str | None = None
+    ranking_metric: str | None = None
+    message: str | None = None
     update: FilterUpdate | None = None
 
     def to_dict(self) -> dict:
@@ -76,6 +83,10 @@ class IntentResult:
     period: str | None = None
     media_scope: str | None = None
     followup_text: str | None = None
+    segment: str | None = None
+    platform: str | None = None
+    view: str | None = None
+    ranking_metric: str | None = None
     confidence: str = "low"
 
 
@@ -89,7 +100,9 @@ def is_data_caliber_question(text: str) -> bool:
 
 def is_media_question(text: str) -> bool:
     lowered = (text or "").lower()
-    return any(h.lower() in lowered for h in MEDIA_HINTS)
+    return any(h.lower() in lowered for h in MEDIA_HINTS) or bool(
+        re.search(r"(?<![a-z])tr(?![a-z])", lowered)
+    )
 
 
 def extract_period(text: str) -> str | None:
@@ -184,6 +197,49 @@ def _route_media(text: str, state: SessionState) -> RouteResult:
     return RouteResult(type="media_analysis", brand=brand, period=period)
 
 
+def _route_market(text: str, state: SessionState, intent: IntentResult | None = None) -> RouteResult:
+    if os.environ.get("MARKET_ANALYSIS_ENABLED", "1") != "1":
+        return RouteResult(type="guide")
+    if intent and intent.segment and str(intent.segment).upper() not in {"PURE MASS", "SELECTIVE", "PROFESSIONAL"}:
+        return RouteResult(type="market_parameter_error", message="目前Segment仅支持Pure Mass、Selective和Professional。")
+    if intent and intent.platform and str(intent.platform).upper() not in {"TTL", "TM", "DY", "JD"}:
+        return RouteResult(type="market_parameter_error", message="目前平台仅支持三平台TTL、天猫、抖音和京东。")
+    ctx = state.market_context
+    explicit_period = (intent.period if intent else None) or extract_media_period(text)
+    inherits_context = bool(re.search(r"^(那|那么|其中|里面|刚才|上面)|第[一二三四五1-5]名|Top\s*5|哪些品牌|品牌.*(最好|最高|最快|排名)", text, re.IGNORECASE))
+    plan = build_market_plan(
+        text,
+        period=explicit_period or (ctx.period if inherits_context else None),
+        segment=(intent.segment if intent else None) or ctx.segment,
+        platform=(intent.platform if intent else None) or ctx.platform,
+        intent=intent.intent if intent else None,
+        view=intent.view if intent else None,
+        ranking_metric=intent.ranking_metric if intent else None,
+    )
+    return RouteResult(
+        type=plan.intent if plan.period else "clarify_market_period",
+        period=plan.period, segment=plan.segment, platform=plan.platform,
+        market_view=plan.view, ranking_metric=plan.ranking_metric,
+    )
+
+
+def _ordinal_brand_route(text: str, state: SessionState) -> RouteResult | None:
+    match = re.search(r"第([一二三四五1-5])名", text)
+    if not match or not state.market_context.top_brands:
+        return None
+    index_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+    rank = index_map.get(match.group(1), int(match.group(1)) if match.group(1).isdigit() else 0)
+    if not 1 <= rank <= len(state.market_context.top_brands):
+        return None
+    brand = state.market_context.top_brands[rank - 1]
+    period = state.market_context.period
+    if is_media_question(text):
+        return RouteResult(type="media_analysis", brand=brand, period=period, media_scope="full_bet")
+    if any(word in text for word in ("生意", "表现", "天猫", "怎么样", "如何")):
+        return RouteResult(type="default_chain", brand=brand, period=period)
+    return None
+
+
 def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | None:
     ctx = state.drilldown_ctx
     context = {
@@ -197,11 +253,13 @@ def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | 
     prompt = f"""
 你是AI生意问答Bot的入口路由器。只判断用户意图和抽取参数，不做分析，不查数据。
 
-意图出口严格只有四类：
+意图出口严格只有六类：
 1. meta：用户问你是谁、能做什么、支持哪些分析、怎么用。
 2. default_analysis：用户想让你分析某品牌在某时间段的整体生意/表现/怎么样。
-3. media_analysis：用户询问媒体投资、BET、BKFS、Social Search、KSI、KOL表现、Engage或CPE。
+3. media_analysis：用户询问媒体投资、BET、BKFS、Social Search、KSI、KOL表现、Engage、CPE或媒体费比（Take Rate/TR/BET%）。
 4. followup：用户基于上一轮天猫报告继续追问某品类/渠道/系列/打法/原因。
+5. market_analysis：用户问大盘、市场整体或市场趋势。
+6. market_brand_ranking：用户问大盘中增长最好、涨幅最高或Top品牌。
 
 当前会话上下文：
 {json.dumps(context, ensure_ascii=False)}
@@ -216,6 +274,9 @@ def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | 
 - 省略品牌或时间时可从上下文继承。
 - 如果用户没写时间，period 必须为 null；系统会追问，禁止补成618或其他时间。
 - followup 输出 followup_text，去掉开头的“追问：”。
+- market_analysis和market_brand_ranking抽取segment、platform、view、ranking_metric；不得输出表名或SQL。
+- segment只允许PURE MASS、SELECTIVE、PROFESSIONAL；platform只允许TTL、TM、DY、JD。
+- “涨得最好/拉动最大”ranking_metric=gmv_growth；“涨幅/增速最高”ranking_metric=evol。
 - 如果用户没写“追问：”，但说“这个品类/上面/刚才/其中/李佳琦表现呢/T2打法”等，且当前上下文has_context=true，可以判为followup。
 - 没有上下文时，不要把省略品牌和时间的问题判为followup。
 
@@ -236,6 +297,10 @@ def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | 
 输出：{{"intent":"followup","brand":null,"period":null,"followup_text":"乳液面霜卖得如何","confidence":"high"}}
 用户：这个品类里李佳琦表现呢
 输出：{{"intent":"followup","brand":null,"period":null,"followup_text":"这个品类里李佳琦表现呢","confidence":"high"}}
+用户：2026年1-6月大盘怎么样
+输出：{{"intent":"market_analysis","period":"2026年1-6月","segment":"PURE MASS","platform":"TTL","view":"summary","ranking_metric":"gmv_growth","confidence":"high"}}
+用户：大盘里涨幅最高的品牌
+输出：{{"intent":"market_brand_ranking","period":null,"segment":"PURE MASS","platform":"TM","view":"top_brands","ranking_metric":"evol","confidence":"high"}}
 
 只返回JSON，不要解释。
 用户问题：{user_text}
@@ -260,7 +325,7 @@ def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | 
         if not parsed:
             return None
         intent = parsed.get("intent")
-        if intent not in {"meta", "default_analysis", "media_analysis", "followup"}:
+        if intent not in {"meta", "default_analysis", "media_analysis", "followup", "market_analysis", "market_brand_ranking"}:
             return None
         return IntentResult(
             intent=intent,
@@ -275,6 +340,10 @@ def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | 
             period=parsed.get("period"),
             media_scope=parsed.get("media_scope"),
             followup_text=parsed.get("followup_text"),
+            segment=parsed.get("segment"),
+            platform=parsed.get("platform"),
+            view=parsed.get("view"),
+            ranking_metric=parsed.get("ranking_metric"),
             confidence=parsed.get("confidence") or "low",
         )
     except Exception as exc:
@@ -365,6 +434,11 @@ def _route_by_rules(user_text: str, state: SessionState) -> RouteResult:
     text = user_text.strip()
     if is_meta_question(text):
         return RouteResult(type="meta")
+    ordinal = _ordinal_brand_route(text, state)
+    if ordinal:
+        return ordinal
+    if is_market_question(text):
+        return _route_market(text, state)
     if text.startswith("追问：") or text.startswith("追问:"):
         followup = re.sub(r"^\s*追问\s*[:：]\s*", "", text, count=1).strip()
         if is_data_caliber_question(followup):
@@ -398,6 +472,14 @@ def route(user_text: str, state: SessionState) -> RouteResult:
     # BET仍是独立报告入口，但品牌、时间和中英文名优先由统一语义路由抽取。
     is_explicit_media = is_media_question(text)
     pending_period = extract_period(text)
+    if state.pending_request and state.pending_request.get("intent") in {"market_analysis", "market_brand_ranking"} and pending_period:
+        pending = state.pending_request
+        return RouteResult(
+            type=pending["intent"], period=pending_period,
+            segment=pending.get("segment") or "PURE MASS", platform=pending.get("platform") or "TTL",
+            market_view=pending.get("market_view") or "summary",
+            ranking_metric=pending.get("ranking_metric") or "gmv_growth",
+        )
     if state.pending_request and state.pending_request.get("intent") == "followup_v2":
         awaiting = state.pending_request.get("awaiting")
         pending_brand = state.pending_request.get("brand")
@@ -427,6 +509,11 @@ def route(user_text: str, state: SessionState) -> RouteResult:
             )
     if text.startswith("追问：") or text.startswith("追问:"):
         followup = re.sub(r"^\s*追问\s*[:：]\s*", "", text, count=1).strip()
+        ordinal = _ordinal_brand_route(followup, state)
+        if ordinal:
+            return ordinal
+        if is_market_question(followup):
+            return _route_market(followup, state)
         if is_data_caliber_question(followup):
             return RouteResult(type="caliber_reject")
         media = is_media_question(followup)
@@ -442,6 +529,11 @@ def route(user_text: str, state: SessionState) -> RouteResult:
             brand_aliases=list(ctx.brand_aliases or state.drilldown_ctx.brand_aliases),
             followup_text=followup,
         )
+
+    # 明确的大盘问句走确定性快速路径，避免为已能完整解析的日期、Segment和平台
+    # 等待路由模型；含糊的非大盘问句仍由统一语义路由处理。
+    if is_market_question(text):
+        return _route_market(text, state)
 
     intent = classify_user_intent(text, state)
     if not intent or intent.confidence != "high":
@@ -462,6 +554,12 @@ def route(user_text: str, state: SessionState) -> RouteResult:
 
     if intent.intent == "meta":
         return RouteResult(type="meta")
+
+    ordinal = _ordinal_brand_route(text, state)
+    if ordinal:
+        return ordinal
+    if intent.intent in {"market_analysis", "market_brand_ranking"} or is_market_question(text):
+        return _route_market(text, state, intent)
 
     if os.environ.get("FOLLOWUP_SKILL_V2_ENABLED", "1") == "1" and is_narrow_followup(text):
         media = is_explicit_media

@@ -82,6 +82,19 @@ def normalize_media_period_hint(text: str) -> str | None:
     )
     if full_dates:
         return full_dates.group(0)
+    full_cn_dates = re.search(
+        rf"(?:(?:20\d{{2}})年)?\d{{1,2}}月\d{{1,2}}[日号]?{_RANGE_SEP}"
+        rf"(?:(?:20\d{{2}})年)?\d{{1,2}}月\d{{1,2}}[日号]?",
+        text,
+    )
+    if full_cn_dates:
+        return full_cn_dates.group(0)
+    single_iso_date = re.search(r"20\d{2}-\d{1,2}-\d{1,2}(?!\d)", text)
+    if single_iso_date:
+        return single_iso_date.group(0)
+    single_cn_date = re.search(r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?", text)
+    if single_cn_date:
+        return single_cn_date.group(0)
     patterns = [
         rf"20\d{{2}}-\d{{1,2}}{_RANGE_SEP}20\d{{2}}-\d{{1,2}}",
         rf"20\d{{2}}年\d{{1,2}}月?{_RANGE_SEP}(?:20\d{{2}}年)?\d{{1,2}}月",

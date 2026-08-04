@@ -144,6 +144,27 @@ def parse_ec_period(period: str, default_year: int) -> dict[str, Any]:
 
 
 def _parse_ec_date_range(value: str, default_year: int) -> tuple[date, date]:
+    single_iso_date = re.fullmatch(r"(20\d{2})-(\d{1,2})-(\d{1,2})", value)
+    if single_iso_date:
+        selected = date(
+            int(single_iso_date.group(1)),
+            int(single_iso_date.group(2)),
+            int(single_iso_date.group(3)),
+        )
+        return selected, selected
+
+    single_cn_date = re.fullmatch(
+        r"(?:(20\d{2})年)?(\d{1,2})月(\d{1,2})[日号]?",
+        value,
+    )
+    if single_cn_date:
+        selected = date(
+            int(single_cn_date.group(1) or default_year),
+            int(single_cn_date.group(2)),
+            int(single_cn_date.group(3)),
+        )
+        return selected, selected
+
     iso_dates = re.fullmatch(
         r"(20\d{2})-(\d{1,2})-(\d{1,2})\s*[~～—–至到]+\s*"
         r"(20\d{2})-(\d{1,2})-(\d{1,2})",
@@ -199,7 +220,7 @@ def _parse_ec_date_range(value: str, default_year: int) -> tuple[date, date]:
         return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
 
     raise ValueError(
-        f"无法解析时间段：{value}。支持单月、月份区间、精确日期区间、618、520或双11。"
+        f"无法解析时间段：{value}。支持单日、单月、月份区间、精确日期区间、618、520或双11。"
     )
 
 
@@ -354,6 +375,12 @@ def normalize_period_hint(text: str) -> str | None:
     md = re.search(r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?[~\-至到]+(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?", text)
     if md:
         return md.group(0)
+    single_iso_date = re.search(r"20\d{2}-\d{1,2}-\d{1,2}(?!\d)", text)
+    if single_iso_date:
+        return single_iso_date.group(0)
+    single_cn_date = re.search(r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?", text)
+    if single_cn_date:
+        return single_cn_date.group(0)
     iso_month_range = re.search(
         r"20\d{2}-\d{1,2}[~～—–\-至到]+20\d{2}-\d{1,2}",
         text,

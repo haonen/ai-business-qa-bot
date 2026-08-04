@@ -18,3 +18,4 @@ description: Analyze focused EC, BET, or EC×BET follow-up questions about perfo
 11. Do not attribute overall change to an individual SKU. SKU is a performance/ranking endpoint only.
 12. When series uses AI inference, append: `产品系列由AI根据产品链接归纳总结，存在误差。`
 13. Render missing values as `—`; do not convert missing data to zero.
+14. Treat media fee ratio, Take Rate, TR, and BET% as the same KPI. If media spend and fee ratio are both requested, retain both in the evidence table.

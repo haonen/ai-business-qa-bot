@@ -17,6 +17,8 @@ from bot.tools.query_ec_followup_table import query_ec_followup_table
 from bot.tools.query_bet_followup_table import query_bet_followup_table
 from bot.tools.query_change_contribution import query_change_contribution
 from bot.tools.query_ec_bet_monthly import query_ec_bet_monthly
+from bot.tools.query_market_trend import query_market_trend
+from bot.tools.query_market_top_brands import query_market_top_brands
 
 
 TOOL_REGISTRY = {
@@ -37,6 +39,8 @@ TOOL_REGISTRY = {
     "query_bet_followup_table": query_bet_followup_table,
     "query_change_contribution": query_change_contribution,
     "query_ec_bet_monthly": query_ec_bet_monthly,
+    "query_market_trend": query_market_trend,
+    "query_market_top_brands": query_market_top_brands,
 }
 
 

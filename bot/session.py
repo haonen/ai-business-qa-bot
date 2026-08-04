@@ -29,6 +29,16 @@ class DomainContext:
 
 
 @dataclass
+class MarketContext:
+    period: str | None = None
+    segment: str = "PURE MASS"
+    platform: str = "TTL"
+    last_view: str | None = None
+    recent_result: dict | None = None
+    top_brands: list[str] = field(default_factory=list)
+
+
+@dataclass
 class SessionState:
     history: list[dict] = field(default_factory=list)
     drilldown_ctx: DrilldownContext = field(default_factory=DrilldownContext)
@@ -36,6 +46,7 @@ class SessionState:
     pending_request: dict | None = None
     ec_context: DomainContext = field(default_factory=DomainContext)
     bet_context: DomainContext = field(default_factory=DomainContext)
+    market_context: MarketContext = field(default_factory=MarketContext)
     last_updated: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -94,4 +105,12 @@ def update_domain_context(open_id: str, domain: str, **kwargs):
     for key, value in kwargs.items():
         if hasattr(ctx, key) and value is not None:
             setattr(ctx, key, value)
+    state.last_updated = datetime.utcnow()
+
+
+def update_market_context(open_id: str, **kwargs):
+    state = get_session(open_id)
+    for key, value in kwargs.items():
+        if hasattr(state.market_context, key) and value is not None:
+            setattr(state.market_context, key, value)
     state.last_updated = datetime.utcnow()

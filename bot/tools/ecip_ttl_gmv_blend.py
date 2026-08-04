@@ -6,6 +6,8 @@ from typing import Callable
 
 import pandas as pd
 
+from bot.tools.market_common import monthly_business_date_sql
+
 
 _TTL_CATEGORY_SQL = "'Skincare', 'Hair', 'Makeup + Fragrance', 'Makeup+Fragrance'"
 
@@ -54,22 +56,23 @@ def query_blended_tmall_ttl_gmv(
     prior_end: str,
 ) -> dict:
     """Use monthly data for complete available months and daily data elsewhere."""
+    monthly_date = monthly_business_date_sql("bus_date")
     monthly_sql = f"""
         SELECT
-          CASE WHEN bus_date BETWEEN :current_start_iso AND :current_end_iso
+          CASE WHEN {monthly_date} BETWEEN :current_start_iso AND :current_end_iso
                THEN 'current' ELSE 'prior' END AS period_key,
-          DATE_FORMAT(bus_date, '%Y-%m') AS source_month,
+          DATE_FORMAT({monthly_date}, '%Y-%m') AS source_month,
           COUNT(*) AS row_count,
           COALESCE(SUM(gmv), 0) AS gmv
         FROM three_platform_store_rank_monthly
         WHERE brand_name = :brand
           AND UPPER(TRIM(platform)) IN ('TM', 'TMALL')
           AND (
-            bus_date BETWEEN :current_start_iso AND :current_end_iso
-            OR bus_date BETWEEN :prior_start_iso AND :prior_end_iso
+            {monthly_date} BETWEEN :current_start_iso AND :current_end_iso
+            OR {monthly_date} BETWEEN :prior_start_iso AND :prior_end_iso
           )
           AND category_EN_level_1 IN ({_TTL_CATEGORY_SQL})
-        GROUP BY period_key, DATE_FORMAT(bus_date, '%Y-%m')
+        GROUP BY period_key, DATE_FORMAT({monthly_date}, '%Y-%m')
     """
     daily_sql = f"""
         SELECT

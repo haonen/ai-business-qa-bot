@@ -27,6 +27,9 @@ and MySQL validation are documented in
 BET media report routing, period rules, Tool contracts, formulas, and runtime
 checks are documented in
 [`docs/media_analysis_runtime.md`](docs/media_analysis_runtime.md).
+Market trend and Top-brand routing, monthly/daily blending, and ranking rules
+are documented in
+[`docs/market_analysis_runtime.md`](docs/market_analysis_runtime.md).
 
 ## Server Directory
 

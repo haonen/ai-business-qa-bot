@@ -157,7 +157,7 @@ AI 不能：
 
 ## 8. 当前业务边界
 
-- 不支持没有接入的大盘、行业或竞品数据。
+- 已支持Pure Mass、Selective和Professional的Total Beauty大盘趋势及Top品牌入口；仍不支持任意行业、竞品或因果分析。
 - 不使用单条 SKU 解释整体同比变化原因。
 - 媒体投入与生意可以做同期信号对照，不直接做因果判断。
 - BET 完整报告当前以2026年为分析年，使用2025年同期计算变化。
@@ -254,6 +254,7 @@ Feishu WebSocket message
 | `clarify_period` | 记录 pending request | 完整 EC 分析缺少时间 |
 | `default_chain` | `run_default_chain` | 完整 EC 生意报告 |
 | `media_analysis` | `run_media_chain` | 完整 BET 报告 |
+| `market_analysis` / `market_brand_ranking` | `run_market_chain` | 大盘趋势 / Top 5品牌 |
 | `skill_dispatch` | `run_followup_v2_chain` | 追问 Skills V2 |
 | `filter_update` | `run_filter_update` | V2 关闭时的兼容路径 |
 
@@ -273,6 +274,7 @@ Feishu WebSocket message
 - `SessionState.pending_request`：等待用户补充品牌或时间的请求；
 - `SessionState.ec_context`：EC 品牌、时间、筛选条件和报告缓存；
 - `SessionState.bet_context`：BET 品牌、时间、跨数据源品牌和报告缓存；
+- `SessionState.market_context`：大盘时间、Segment、平台、最近结果和Top 5品牌；
 - `SessionState.drilldown_ctx`：旧追问代码仍需要的兼容上下文。
 
 EC 和 BET 上下文必须保持分离，切换报告类型时不得清除另一个领域的上下文。
@@ -366,6 +368,7 @@ Tool 在 `bot/tools/` 中。`bot/tools/__init__.py::TOOL_REGISTRY` 列出了已�
 |---|---|
 | EC 完整报告 | `query_category`、`query_ecip_tmall_gmv`、`query_series`、`query_sku_list`、`query_driver` |
 | BET 完整报告 | `query_social_search`、`query_media_investment`、`query_ec_nso`、`query_kol_performance` |
+| 大盘入口 | `query_market_trend`、`query_market_top_brands` |
 | EC 追问 | `query_ec_followup_table` |
 | BET 追问 | `query_bet_followup_table` |
 | 贡献/拖累 | `query_change_contribution` |
@@ -489,6 +492,7 @@ python -m unittest discover -s tests -v
 | `tests/test_ec_analysis.py` | EC 品牌、时间、口径、默认报告和 ECIP GMV |
 | `tests/test_media_analysis.py` | BET 路由、品牌解析、Tool、报告和指标口径 |
 | `tests/test_followup_v2.py` | 追问路由、Plan 校验、Skill 合同、Tool、Insight 和文档规则 |
+| `tests/test_market_analysis.py` | 大盘路由、月日混合、Top 5和上下文跳转 |
 | `tests/test_*_pipeline.py` | Search、Topline、KSI 等离线数据清洗 |
 
 修改一个子系统时，先运行对应定向测试，最后必须运行完整测试。

@@ -8,7 +8,7 @@ import pandas as pd
 
 from bot.followup_formatter import format_followup_result
 from bot.followup_plan import build_followup_plan, validate_plan
-from bot.router import IntentResult, route
+from bot.router import IntentResult, is_media_question, route
 from bot.session import SessionState
 from bot.skills.loader import load_meta_answers
 from bot.tools.query_bet_followup_table import query_bet_followup_table
@@ -19,6 +19,11 @@ from bot.app import _run_direct
 
 
 class FollowupRouteV2Test(unittest.TestCase):
+    def test_fee_ratio_aliases_are_media_intents(self):
+        for question in ("按月整理Take Rate", "按月整理TR", "按月整理BET%"):
+            with self.subTest(question=question):
+                self.assertTrue(is_media_question(question))
+
     def test_capability_questions_route_to_meta(self):
         for question in ("你会什么？", "你能干什么？", "你可以做什么？"):
             self.assertEqual(route(question, SessionState()).type, "meta")
@@ -140,6 +145,40 @@ class FollowupPlannerTest(unittest.TestCase):
         self.assertEqual(plan.group_by, ["month"])
         self.assertEqual(plan.metrics, ["fee_ratio", "fee_ratio_change"])
         self.assertEqual(plan.period["start"], "2026-01-01")
+
+    def test_monthly_spend_and_fee_ratio_keeps_both_metric_families(self):
+        state = SessionState()
+        state.bet_context.brand = "KANS"
+        state.bet_context.period = "2026年1-6月"
+        plan = build_followup_plan("by month的媒体花费和费比", state)
+        self.assertEqual(plan.group_by, ["month"])
+        self.assertEqual(
+            plan.metrics,
+            ["spend_actual", "spend_evol", "fee_ratio", "fee_ratio_change"],
+        )
+
+    def test_fee_ratio_aliases_map_to_same_metrics(self):
+        for wording in ("按月整理Take Rate", "按月整理TR", "按月整理BET%"):
+            with self.subTest(wording=wording):
+                state = SessionState()
+                state.bet_context.brand = "KANS"
+                state.bet_context.period = "2026年1-6月"
+                plan = build_followup_plan(wording, state)
+                self.assertEqual(plan.domain, "bet")
+                self.assertEqual(plan.metrics, ["fee_ratio", "fee_ratio_change"])
+
+    @patch("bot.followup_plan._llm_plan")
+    def test_explicit_spend_is_restored_when_llm_omits_it(self, llm_plan):
+        llm_plan.return_value = {
+            "skill": "data_organizer", "domain": "bet", "mode": "monthly_trend",
+            "brand": "KANS", "period": {"raw": "2026年1-6月"}, "filters": {},
+            "group_by": ["month"], "metrics": ["fee_ratio", "fee_ratio_change"],
+        }
+        plan = build_followup_plan("KANS 1-6月by month的媒体花费和费比", SessionState())
+        self.assertEqual(
+            plan.metrics,
+            ["spend_actual", "spend_evol", "fee_ratio", "fee_ratio_change"],
+        )
 
     @patch("bot.followup_plan._llm_plan")
     def test_period_fee_ratio_accepts_period_as_time_grain(self, llm_plan):
@@ -273,6 +312,19 @@ class FollowupToolTest(unittest.TestCase):
 
 
 class FollowupFormatterTest(unittest.TestCase):
+    def test_spend_and_fee_ratio_columns_are_both_rendered(self):
+        plan = {
+            "skill": "data_organizer", "domain": "bet", "mode": "monthly_trend",
+            "brand": "KANS", "period": {"raw": "2026年1-2月"}, "filters": {},
+            "group_by": ["month"],
+            "metrics": ["spend_actual", "spend_evol", "fee_ratio", "fee_ratio_change"],
+        }
+        result = {"rows": [{"month": "2026-01", "spend_actual": 1000000,
+                            "spend_evol": .1, "fee_ratio": .2, "fee_ratio_change": .01}], "evidence": []}
+        rendered = format_followup_result(plan, result)
+        self.assertIn("媒体花费 Actual", rendered["markdown"])
+        self.assertIn("媒体费比", rendered["markdown"])
+
     def test_data_organizer_stays_table_only_and_inline(self):
         plan = {"skill": "data_organizer", "domain": "bet", "mode": "monthly_trend", "brand": "珀莱雅", "period": {"raw": "2026年1-2月"}, "filters": {}, "group_by": ["month"], "metrics": ["fee_ratio", "fee_ratio_change"]}
         result = {"rows": [{"month": "2026-01", "fee_ratio": .2, "fee_ratio_change": .01}], "evidence": []}

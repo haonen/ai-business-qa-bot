@@ -419,6 +419,7 @@ class EcipTmallGmvTest(unittest.TestCase):
         daily_sql = fetch_df.call_args_list[1].args[0]
         params = fetch_df.call_args_list[1].args[1]
         self.assertIn("three_platform_store_rank_monthly", monthly_sql)
+        self.assertIn("LPAD(DAY(bus_date), 2, '0')", monthly_sql)
         self.assertIn("UPPER(TRIM(platform)) IN ('TM', 'TMALL')", monthly_sql)
         self.assertIn("tmall_store_ranking_day_jiashicang", daily_sql)
         for sql in (monthly_sql, daily_sql):

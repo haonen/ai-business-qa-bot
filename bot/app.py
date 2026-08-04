@@ -12,6 +12,9 @@ from bot.session import SessionState, set_cache, set_pending_request, update_con
 from bot.skills.loader import load_meta_answers
 from bot.followup_plan import is_narrow_followup
 from bot.chains.followup_v2_chain import run_followup_v2_chain
+from bot.chains.market_chain import run_market_chain
+from bot.market_plan import MarketPlan
+from bot.session import update_market_context
 
 
 log = logging.getLogger(__name__)
@@ -72,6 +75,10 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
         state["markdown"] = GUIDE_TEXT
         state["meta"] = {}
         return state
+    if route_result.type == "market_parameter_error":
+        state["markdown"] = route_result.message or "大盘参数暂不支持。"
+        state["meta"] = {"document_ready": False, "domain": "market"}
+        return state
     if route_result.type == "clarify_period":
         set_pending_request(open_id, {
             "intent": "default_analysis",
@@ -88,6 +95,17 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
             "document_ready": False,
             "awaiting": "period",
         }
+        return state
+    if route_result.type == "clarify_market_period":
+        set_pending_request(open_id, {
+            "intent": "market_brand_ranking" if route_result.market_view == "top_brands" else "market_analysis",
+            "segment": route_result.segment or "PURE MASS",
+            "platform": route_result.platform or "TTL",
+            "market_view": route_result.market_view or "summary",
+            "ranking_metric": route_result.ranking_metric or "gmv_growth",
+        })
+        state["markdown"] = "你想看哪个时间段的大盘？例如：2026年1—6月，或2026年7月1日到7月10日。"
+        state["meta"] = {"document_ready": False, "awaiting": "period", "domain": "market"}
         return state
     if route_result.type == "default_chain":
         set_pending_request(open_id, None)
@@ -142,6 +160,34 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
             source_brands=state["meta"].get("resolved_brands") or {},
             report_cache=state["meta"].get("last_result_cache"),
         )
+        return state
+    if route_result.type in {"market_analysis", "market_brand_ranking"}:
+        set_pending_request(open_id, None)
+        plan = MarketPlan(
+            intent=route_result.type,
+            period=route_result.period,
+            segment=route_result.segment or "PURE MASS",
+            platform=route_result.platform or "TTL",
+            view=route_result.market_view or ("top_brands" if route_result.type == "market_brand_ranking" else "summary"),
+            ranking_metric=route_result.ranking_metric or "gmv_growth",
+        )
+        result = run_market_chain(plan)
+        state["markdown"] = result["markdown"]
+        state["meta"] = result.get("meta", {})
+        # 即使当前口径因数据覆盖不足而失败，也保留用户刚指定的时间和
+        # Segment。这样用户紧接着说“那就看天猫Top 5”时可以继承原期间。
+        update_market_context(
+            open_id,
+            period=route_result.period,
+            segment=plan.segment,
+            platform=plan.platform,
+            last_view=plan.view,
+        )
+        if result.get("ok"):
+            update_market_context(
+                open_id, recent_result=state["meta"].get("market_result"),
+                top_brands=state["meta"].get("top_brands") or [],
+            )
         return state
     if route_result.type == "filter_update":
         update = route_result.update.__dict__ if route_result.update else {}
@@ -206,9 +252,13 @@ def build_graph():
     graph.add_node("meta_reply", lambda s: {**s, "markdown": load_meta_answers(), "meta": {}})
     graph.add_node("caliber_reject", lambda s: {**s, "markdown": CALIBER_REJECT_TEXT, "meta": {}})
     graph.add_node("guide", lambda s: {**s, "markdown": GUIDE_TEXT, "meta": {}})
+    graph.add_node("market_parameter_error", lambda s: _run_direct(s))
     graph.add_node("clarify_period", lambda s: _run_direct(s))
+    graph.add_node("clarify_market_period", lambda s: _run_direct(s))
     graph.add_node("default_chain", lambda s: _run_direct(s))
     graph.add_node("media_analysis", lambda s: _run_direct(s))
+    graph.add_node("market_analysis", lambda s: _run_direct(s))
+    graph.add_node("market_brand_ranking", lambda s: _run_direct(s))
     graph.add_node("filter_update", lambda s: _run_direct(s))
     graph.add_node("skill_dispatch", lambda s: _run_direct(s))
     graph.set_entry_point("router")
@@ -216,15 +266,19 @@ def build_graph():
         "meta": "meta_reply",
         "caliber_reject": "caliber_reject",
         "guide": "guide",
+        "market_parameter_error": "market_parameter_error",
         "clarify_period": "clarify_period",
+        "clarify_market_period": "clarify_market_period",
         "default_chain": "default_chain",
         "media_analysis": "media_analysis",
+        "market_analysis": "market_analysis",
+        "market_brand_ranking": "market_brand_ranking",
         "filter_update": "filter_update",
         "skill_dispatch": "skill_dispatch",
     })
     for node in [
-        "meta_reply", "caliber_reject", "guide", "clarify_period", "default_chain",
-        "media_analysis", "filter_update", "skill_dispatch",
+        "meta_reply", "caliber_reject", "guide", "market_parameter_error", "clarify_period", "default_chain",
+        "media_analysis", "market_analysis", "market_brand_ranking", "clarify_market_period", "filter_update", "skill_dispatch",
     ]:
         graph.add_edge(node, END)
     return graph.compile()

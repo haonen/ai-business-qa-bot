@@ -143,16 +143,17 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
         add_message(open_id, "assistant", markdown)
 
         route_type = result.get("route_type")
-        if (
-            route_type in {"default_chain", "media_analysis", "skill_dispatch"}
-            and result.get("meta", {}).get("brand")
-            and result.get("meta", {}).get("document_ready", True)
-        ):
+        report_meta = result.get("meta", {})
+        market_document = route_type in {"market_analysis", "market_brand_ranking"}
+        brand_document = route_type in {"default_chain", "media_analysis", "skill_dispatch"} and report_meta.get("brand")
+        if (market_document or brand_document) and report_meta.get("document_ready", True):
             import bot.feishu_doc as feishu_doc
 
             brand = result["meta"].get("brand")
             period = result["meta"].get("period")
-            if route_type == "skill_dispatch":
+            if market_document:
+                doc_title = result["meta"].get("document_title") or f"{period} 大盘分析"
+            elif route_type == "skill_dispatch":
                 doc_title = result["meta"].get("document_title") or f"{brand} {period} 数据分析"
             elif route_type == "media_analysis":
                 period_title = result["meta"].get("period_display") or period

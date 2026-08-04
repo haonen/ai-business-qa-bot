@@ -431,7 +431,7 @@ def _render_media(investment: dict, nso: dict) -> str:
         ),
         (
             "> _Wgt Change=本期Wgt%-上年同期Wgt%；"
-            "媒体费比=媒体花费（元）/TTL NSO；费比变化为百分点变化。_"
+            "媒体费比（也称Take Rate、TR或BET%）=媒体花费（元）/TTL NSO；费比变化为百分点变化。_"
         ),
         "",
         "## 1.1 Overall",

@@ -107,6 +107,26 @@ def main():
         "idx_ecip_monthly_brand_date_platform",
         "brand_name(100), bus_date, platform(16)",
     )
+    _ensure_index(
+        "three_platforms_segmented_markets_monthly",
+        "idx_market_monthly_scope",
+        "global_segment(50), category_EN(50), platform(16), bus_date",
+    )
+    _ensure_index(
+        "three_platforms_segmented_markets_daily",
+        "idx_market_daily_scope",
+        "global_segment(50), category_EN(50), platform(16), bus_date",
+    )
+    _ensure_index(
+        "three_platform_store_rank_monthly",
+        "idx_market_brand_monthly_scope",
+        "SELECTIVITY(50), platform(16), bus_date, brand_name(100), category_EN_level_1(50)",
+    )
+    _ensure_index(
+        "tmall_store_ranking_day_jiashicang",
+        "idx_market_brand_daily_scope",
+        "SELECTIVITY(50), bus_date, brand_name(100), category_EN_level_1(50)",
+    )
 
 
 if __name__ == "__main__":

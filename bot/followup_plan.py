@@ -25,7 +25,10 @@ NARROW_HINTS = (
     "按月", "by month", "整理", "列出", "表格", "趋势", "排名", "top", "对比", "比较",
     "拖累", "贡献", "构成", "靠哪些", "性价比", "同步", "背离", "有没有涨",
 )
-BET_HINTS = ("媒体", "费比", "ait", "bkfs", "bkfst", "search", "搜索", "kol", "达人", "engage", "cpe", "投放")
+BET_HINTS = (
+    "媒体", "费比", "take rate", "take-rate", "take_rate", "bet%",
+    "ait", "bkfs", "bkfst", "search", "搜索", "kol", "达人", "engage", "cpe", "投放",
+)
 EC_HINTS = ("生意", "gmv", "品类", "类目", "系列", "链接", "sku", "key driver", "渠道", "功能线")
 EC_METRICS = {"gmv_actual", "gmv_evol", "unit_actual", "unit_evol", "atv_actual"}
 BET_METRICS = {
@@ -62,6 +65,33 @@ class FollowupPlan:
 def is_narrow_followup(text: str) -> bool:
     lowered = str(text or "").casefold()
     return any(h.casefold() in lowered for h in NARROW_HINTS)
+
+
+def _mentions_fee_ratio(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return (
+        any(token in lowered for token in ("费比", "take rate", "take-rate", "take_rate", "bet%"))
+        or bool(re.search(r"(?<![a-z])tr(?![a-z])", lowered))
+    )
+
+
+def _mentions_media_spend(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return any(token in lowered for token in ("媒体花费", "媒体投资", "媒体费用", "media spend", "spend"))
+
+
+def _enforce_explicit_metrics(plan: FollowupPlan, text: str) -> FollowupPlan:
+    """Keep every KPI explicitly requested by the user, even if the planner omitted one."""
+    if plan.domain not in {"bet", "ec_bet"}:
+        return plan
+    required: list[str] = []
+    if _mentions_media_spend(text):
+        required.extend(["spend_actual", "spend_evol"])
+    if _mentions_fee_ratio(text):
+        required.extend(["fee_ratio", "fee_ratio_change"])
+    if required:
+        plan.metrics = list(dict.fromkeys([*required, *plan.metrics]))
+    return plan
 
 
 def _context_payload(state: SessionState) -> dict:
@@ -104,7 +134,7 @@ def _skill_guidance() -> str:
 
 def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | None) -> dict:
     lowered = text.casefold()
-    has_bet = any(token in lowered for token in BET_HINTS)
+    has_bet = any(token in lowered for token in BET_HINTS) or _mentions_fee_ratio(text)
     has_ec = any(token in lowered for token in EC_HINTS)
     domain = "ec_bet" if (has_bet and has_ec) or ("搜索" in text and "生意" in text) else ("bet" if has_bet else "ec")
     ctx = state.bet_context if domain == "bet" else state.ec_context
@@ -147,12 +177,15 @@ def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | 
         metrics = ["gmv_actual", "gmv_evol"]
         if "搜索" in text:
             metrics.extend(["search_actual", "search_evol"])
-        elif "费比" in text:
+        elif _mentions_fee_ratio(text):
             metrics.extend(["fee_ratio", "fee_ratio_change"])
         else:
             metrics.extend(["spend_actual", "spend_evol"])
-    elif "费比" in text:
-        metrics = ["fee_ratio", "fee_ratio_change"]
+    elif _mentions_fee_ratio(text):
+        metrics = []
+        if _mentions_media_spend(text):
+            metrics.extend(["spend_actual", "spend_evol"])
+        metrics.extend(["fee_ratio", "fee_ratio_change"])
         if group_by == ["month"] and re.search(r"(?<![A-Za-z])(Awareness|Influencer|Transaction)(?![A-Za-z])", text, re.I):
             group_by.append("ait")
     elif "搜索" in text:
@@ -212,6 +245,7 @@ skill只能analysis_drill或data_organizer；domain只能ec/bet/ec_bet。
 group_by只能month/category/key_driver/series/sku/ait/platform/bkfst/kol_platform/tier/kol_type/kol。
 filters只能category/key_driver/series/function_tag/platform/ait/bkfst/tier/kol_type。
 metrics只能gmv_actual/gmv_evol/unit_actual/unit_evol/atv_actual/spend_actual/spend_evol/spend_weight/spend_weight_change/nso_actual/nso_evol/fee_ratio/fee_ratio_change/search_actual/search_evol/cost_actual/cost_evol/cost_weight/cost_weight_change/engage_actual/engage_evol/cpe。
+媒体费比、Take Rate、TR和BET%是同一个KPI，统一使用fee_ratio/fee_ratio_change。用户同时点名媒体花费和费比时，metrics必须同时包含spend_actual、spend_evol、fee_ratio、fee_ratio_change，不得省略任何一个。
 不要补造品牌或时间；缺失就空字符串。用户说按月/整理/列出/表格/趋势/排名/对比时优先data_organizer，EC与BET同月对照用analysis_drill+ec_bet+trend_alignment。
 """
     try:
@@ -355,7 +389,9 @@ def build_followup_plan(text: str, state: SessionState, *, brand: str | None = N
     llm_raw = _llm_plan(text, state, brand, period)
     if llm_raw:
         try:
-            return validate_plan(llm_raw, state, brand=brand, period=period)
+            return _enforce_explicit_metrics(
+                validate_plan(llm_raw, state, brand=brand, period=period), text
+            )
         except ValueError as exc:
             log.warning(
                 "[followup_v2] invalid llm plan, falling back to rules: error=%s plan=%s",
@@ -363,4 +399,6 @@ def build_followup_plan(text: str, state: SessionState, *, brand: str | None = N
                 llm_raw,
             )
     rule_raw = _rule_plan(text, state, brand, period)
-    return validate_plan(rule_raw, state, brand=brand, period=period)
+    return _enforce_explicit_metrics(
+        validate_plan(rule_raw, state, brand=brand, period=period), text
+    )

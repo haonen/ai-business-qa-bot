@@ -59,6 +59,7 @@ description: 生成品牌BET媒体投资飞书报告。用于媒体投资、BET�
 - Transaction下的天猫、抖音和京东只展示花费、Evol%、Wgt%和Wgt Change，
   不展示NSO或媒体费比。
 - 费比变化为本期费比减上年同期费比，单位为百分点`pp`。
+- 媒体费比也称Take Rate、TR或BET%；这些名称均使用同一个“媒体花费÷TTL NSO”口径。
 - 20%–30%作为媒体费比的业务参考；超过该范围可表述为“投入相对较重”。
 - BKFS只展示当前Wgt%和相对上年同期的Wgt Change。
 - BKFST表格保留B/K/F/S/T代码，洞察必须翻译成业务语言：
