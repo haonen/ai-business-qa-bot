@@ -5,6 +5,9 @@ import os
 from typing import TypedDict
 
 from bot.chains.default_chain import run_default_chain
+from bot.chains.brand_business_investment_chain import run_brand_business_investment_chain
+from bot.chains.douyin_business_chain import run_douyin_business_chain
+from bot.chains.jd_business_chain import run_jd_business_chain
 from bot.chains.media_chain import run_media_chain
 from bot.chains.skill_chain import run_filter_update
 from bot.router import route
@@ -26,7 +29,9 @@ CALIBER_REJECT_TEXT = (
 )
 
 GUIDE_TEXT = (
-    "你可以这样问：谷雨2026年6月怎么样；或“分析2026年3月谷雨的媒体投资”。"
+    "你可以这样问：谷雨2026年6月怎么样；“生成韩束2026年6月抖音生意分析报告”；"
+    "“生成珀莱雅2026年6月京东品牌生意分析”；"
+    "或“分析2026年3月谷雨的媒体投资”。"
     "天猫生意追问可写“追问：T2的打法是什么”。"
 )
 
@@ -79,6 +84,28 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
         state["markdown"] = route_result.message or "大盘参数暂不支持。"
         state["meta"] = {"document_ready": False, "domain": "market"}
         return state
+    if route_result.type == "clarify_analysis_scope":
+        set_pending_request(open_id, {
+            "intent": "analysis_preflight",
+            "target": route_result.preflight_target,
+            "brand": route_result.brand,
+            "period": route_result.period,
+            "brand_aliases": route_result.brand_aliases or [],
+            "platform": route_result.platform,
+            "segment": route_result.segment,
+            "market_view": route_result.market_view,
+            "ranking_metric": route_result.ranking_metric,
+            "ranking_limit": route_result.ranking_limit,
+        })
+        state["markdown"] = route_result.message or "请确认分析范围后再开始查询。"
+        state["meta"] = {
+            "brand": route_result.brand,
+            "period": route_result.period,
+            "platform": route_result.platform,
+            "document_ready": False,
+            "awaiting": "analysis_scope_confirmation",
+        }
+        return state
     if route_result.type == "clarify_period":
         set_pending_request(open_id, {
             "intent": "default_analysis",
@@ -96,13 +123,69 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
             "awaiting": "period",
         }
         return state
+    if route_result.type == "clarify_business_platform":
+        set_pending_request(open_id, {
+            "intent": "brand_business_investment_analysis",
+            "brand": route_result.brand,
+            "period": route_result.period,
+            "brand_aliases": route_result.brand_aliases or [],
+        })
+        state["markdown"] = (
+            f"你想看{route_result.brand or '这个品牌'}在哪个平台的生意和主推商品？"
+            "请回复：天猫、抖音或京东。BET媒体投资会同时按同一期间输出。"
+        )
+        state["meta"] = {
+            "brand": route_result.brand,
+            "period": route_result.period,
+            "document_ready": False,
+            "awaiting": "platform",
+            "domain": "business_bet",
+        }
+        return state
+    if route_result.type == "clarify_douyin_period":
+        set_pending_request(open_id, {
+            "intent": "douyin_business_analysis",
+            "brand": route_result.brand,
+            "brand_aliases": route_result.brand_aliases or [],
+        })
+        state["markdown"] = (
+            f"你想分析{route_result.brand or '这个品牌'}的哪个抖音生意时间段？"
+            "例如：2026年6月，或2026年7月1日到7月19日。"
+        )
+        state["meta"] = {
+            "brand": route_result.brand,
+            "period": None,
+            "document_ready": False,
+            "awaiting": "period",
+            "domain": "douyin_business",
+        }
+        return state
+    if route_result.type == "clarify_jd_period":
+        set_pending_request(open_id, {
+            "intent": "jd_business_analysis",
+            "brand": route_result.brand,
+            "brand_aliases": route_result.brand_aliases or [],
+        })
+        state["markdown"] = (
+            f"你想分析{route_result.brand or '这个品牌'}的哪个京东生意时间段？"
+            "例如：2026年6月，或2026年7月1日到7月19日。"
+        )
+        state["meta"] = {
+            "brand": route_result.brand,
+            "period": None,
+            "document_ready": False,
+            "awaiting": "period",
+            "domain": "jd_business",
+        }
+        return state
     if route_result.type == "clarify_market_period":
         set_pending_request(open_id, {
-            "intent": "market_brand_ranking" if route_result.market_view == "top_brands" else "market_analysis",
+            "intent": route_result.type if route_result.type in {"market_brand_ranking", "market_brand_deep_dive"} else "market_analysis",
             "segment": route_result.segment or "PURE MASS",
             "platform": route_result.platform or "TTL",
             "market_view": route_result.market_view or "summary",
-            "ranking_metric": route_result.ranking_metric or "gmv_growth",
+            "ranking_metric": route_result.ranking_metric or "gmv_actual",
+            "ranking_limit": route_result.ranking_limit or 5,
         })
         state["markdown"] = "你想看哪个时间段的大盘？例如：2026年1—6月，或2026年7月1日到7月10日。"
         state["meta"] = {"document_ready": False, "awaiting": "period", "domain": "market"}
@@ -136,6 +219,62 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
             report_cache=state["meta"].get("last_result_cache"),
         )
         return state
+    if route_result.type == "brand_business_investment_analysis":
+        set_pending_request(open_id, None)
+        result = run_brand_business_investment_chain(
+            route_result.brand or "",
+            route_result.period or "",
+            route_result.platform or "",
+            brand_aliases=route_result.brand_aliases,
+            on_progress=on_progress,
+        )
+        state["markdown"] = result["markdown"]
+        state["meta"] = result.get("meta", {})
+        if state["meta"].get("last_result_cache"):
+            set_cache(open_id, state["meta"]["last_result_cache"])
+        return state
+    if route_result.type == "douyin_business_analysis":
+        set_pending_request(open_id, None)
+        result = run_douyin_business_chain(
+            route_result.brand or "",
+            route_result.period or "",
+            brand_aliases=route_result.brand_aliases,
+            on_progress=on_progress,
+        )
+        state["markdown"] = result["markdown"]
+        state["meta"] = result.get("meta", {})
+        update_context(
+            open_id,
+            brand=state["meta"].get("brand"),
+            brand_aliases=state["meta"].get("brand_aliases"),
+            period=state["meta"].get("period"),
+            category=state["meta"].get("selected_category"),
+            last_analysis_view="douyin_business_analysis",
+        )
+        if state["meta"].get("last_result_cache"):
+            set_cache(open_id, state["meta"]["last_result_cache"])
+        return state
+    if route_result.type == "jd_business_analysis":
+        set_pending_request(open_id, None)
+        result = run_jd_business_chain(
+            route_result.brand or "",
+            route_result.period or "",
+            brand_aliases=route_result.brand_aliases,
+            on_progress=on_progress,
+        )
+        state["markdown"] = result["markdown"]
+        state["meta"] = result.get("meta", {})
+        update_context(
+            open_id,
+            brand=state["meta"].get("brand"),
+            brand_aliases=state["meta"].get("brand_aliases"),
+            period=state["meta"].get("period"),
+            category=state["meta"].get("selected_category"),
+            last_analysis_view="jd_business_analysis",
+        )
+        if state["meta"].get("last_result_cache"):
+            set_cache(open_id, state["meta"]["last_result_cache"])
+        return state
     if route_result.type == "media_analysis":
         result = run_media_chain(
             route_result.brand or "",
@@ -161,7 +300,7 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
             report_cache=state["meta"].get("last_result_cache"),
         )
         return state
-    if route_result.type in {"market_analysis", "market_brand_ranking"}:
+    if route_result.type in {"market_analysis", "market_brand_ranking", "market_brand_deep_dive"}:
         set_pending_request(open_id, None)
         plan = MarketPlan(
             intent=route_result.type,
@@ -169,7 +308,8 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
             segment=route_result.segment or "PURE MASS",
             platform=route_result.platform or "TTL",
             view=route_result.market_view or ("top_brands" if route_result.type == "market_brand_ranking" else "summary"),
-            ranking_metric=route_result.ranking_metric or "gmv_growth",
+            ranking_metric=route_result.ranking_metric or "gmv_actual",
+            ranking_limit=route_result.ranking_limit or 5,
         )
         result = run_market_chain(plan)
         state["markdown"] = result["markdown"]
@@ -253,12 +393,20 @@ def build_graph():
     graph.add_node("caliber_reject", lambda s: {**s, "markdown": CALIBER_REJECT_TEXT, "meta": {}})
     graph.add_node("guide", lambda s: {**s, "markdown": GUIDE_TEXT, "meta": {}})
     graph.add_node("market_parameter_error", lambda s: _run_direct(s))
+    graph.add_node("clarify_analysis_scope", lambda s: _run_direct(s))
     graph.add_node("clarify_period", lambda s: _run_direct(s))
+    graph.add_node("clarify_business_platform", lambda s: _run_direct(s))
+    graph.add_node("clarify_douyin_period", lambda s: _run_direct(s))
+    graph.add_node("clarify_jd_period", lambda s: _run_direct(s))
     graph.add_node("clarify_market_period", lambda s: _run_direct(s))
     graph.add_node("default_chain", lambda s: _run_direct(s))
+    graph.add_node("brand_business_investment_analysis", lambda s: _run_direct(s))
+    graph.add_node("douyin_business_analysis", lambda s: _run_direct(s))
+    graph.add_node("jd_business_analysis", lambda s: _run_direct(s))
     graph.add_node("media_analysis", lambda s: _run_direct(s))
     graph.add_node("market_analysis", lambda s: _run_direct(s))
     graph.add_node("market_brand_ranking", lambda s: _run_direct(s))
+    graph.add_node("market_brand_deep_dive", lambda s: _run_direct(s))
     graph.add_node("filter_update", lambda s: _run_direct(s))
     graph.add_node("skill_dispatch", lambda s: _run_direct(s))
     graph.set_entry_point("router")
@@ -267,18 +415,26 @@ def build_graph():
         "caliber_reject": "caliber_reject",
         "guide": "guide",
         "market_parameter_error": "market_parameter_error",
+        "clarify_analysis_scope": "clarify_analysis_scope",
         "clarify_period": "clarify_period",
+        "clarify_business_platform": "clarify_business_platform",
+        "clarify_douyin_period": "clarify_douyin_period",
+        "clarify_jd_period": "clarify_jd_period",
         "clarify_market_period": "clarify_market_period",
         "default_chain": "default_chain",
+        "brand_business_investment_analysis": "brand_business_investment_analysis",
+        "douyin_business_analysis": "douyin_business_analysis",
+        "jd_business_analysis": "jd_business_analysis",
         "media_analysis": "media_analysis",
         "market_analysis": "market_analysis",
         "market_brand_ranking": "market_brand_ranking",
+        "market_brand_deep_dive": "market_brand_deep_dive",
         "filter_update": "filter_update",
         "skill_dispatch": "skill_dispatch",
     })
     for node in [
-        "meta_reply", "caliber_reject", "guide", "market_parameter_error", "clarify_period", "default_chain",
-        "media_analysis", "market_analysis", "market_brand_ranking", "clarify_market_period", "filter_update", "skill_dispatch",
+        "meta_reply", "caliber_reject", "guide", "market_parameter_error", "clarify_analysis_scope", "clarify_period", "clarify_business_platform", "clarify_douyin_period", "clarify_jd_period", "default_chain", "brand_business_investment_analysis", "douyin_business_analysis", "jd_business_analysis",
+        "media_analysis", "market_analysis", "market_brand_ranking", "market_brand_deep_dive", "clarify_market_period", "filter_update", "skill_dispatch",
     ]:
         graph.add_edge(node, END)
     return graph.compile()

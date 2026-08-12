@@ -4,6 +4,7 @@ import pandas as pd
 
 from bot.db.connection import fetch_df
 from bot.tools.common import tool
+from bot.tools.followup_common import month_keys
 from bot.utils import safe_div, safe_evol
 
 
@@ -217,7 +218,7 @@ def query_media_investment(
             """
             SELECT
                 year,
-                period_month,
+                CAST(period_month AS DATE) AS period_month,
                 media,
                 submedia,
                 ait_roe,
@@ -229,11 +230,11 @@ def query_media_investment(
             FROM ai_bot_media_topline_investment
             WHERE brand_r = :brand
               AND (
-                period_month BETWEEN :focus_start AND :focus_end
-                OR period_month BETWEEN :prior_start AND :prior_end
+                CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end
+                OR CAST(period_month AS DATE) BETWEEN :prior_start AND :prior_end
               )
             GROUP BY
-                year, period_month, media, submedia, ait_roe,
+                year, CAST(period_month AS DATE), media, submedia, ait_roe,
                 bkfs_overall, bkfs_xiaohongshu, bkfs_douyin
             """,
             {
@@ -258,6 +259,37 @@ def query_media_investment(
             if column not in df:
                 df[column] = ""
             df[column] = df[column].fillna("").astype(str).str.strip()
+        requested_months = month_keys(focus_start, focus_end)
+        current_months = sorted(
+            df.loc[df["year"] == current_year, "period_month"]
+            .dt.strftime("%Y-%m")
+            .unique()
+            .tolist()
+        )
+        missing_current_months = [
+            month for month in requested_months if month not in current_months
+        ]
+        if missing_current_months:
+            missing_text = "、".join(f"{int(month[-2:])}月" for month in missing_current_months)
+            latest_text = (
+                f"，当前最新可用月份为{int(current_months[-1][-2:])}月"
+                if current_months
+                else ""
+            )
+            return {
+                "error": "requested_period_incomplete",
+                "message": (
+                    f"Topline的BET花费数据尚未覆盖{missing_text}{latest_text}。"
+                    "为避免把部分月份累计值误当成完整区间，"
+                    "本次不返回该时间段的BET花费数字。"
+                ),
+                "brand": brand,
+                "coverage": {
+                    "requested_months": requested_months,
+                    "current_months": current_months,
+                    "missing_current_months": missing_current_months,
+                },
+            }
         current = float(df.loc[df["year"] == current_year, "spend_million"].sum())
         prior = float(df.loc[df["year"] == prior_year, "spend_million"].sum())
         current_rows = int(df.loc[df["year"] == current_year, "row_count"].sum())
@@ -299,9 +331,8 @@ def query_media_investment(
                 "douyin": _mix_rows(df, "bkfs_douyin", "douyin", current_year, prior_year),
             },
             "coverage": {
-                "current_months": sorted(
-                    df.loc[df["year"] == current_year, "period_month"].dt.strftime("%Y-%m").unique().tolist()
-                ),
+                "requested_months": requested_months,
+                "current_months": current_months,
                 "prior_months": sorted(
                     df.loc[df["year"] == prior_year, "period_month"].dt.strftime("%Y-%m").unique().tolist()
                 ),

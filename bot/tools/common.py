@@ -56,10 +56,10 @@ def ec_query_context(
 
     latest = fetch_one(
         """
-        SELECT bus_date AS max_date
+        SELECT CAST(bus_date AS DATE) AS max_date
         FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
         WHERE brand_name = :brand
-        ORDER BY bus_date DESC
+        ORDER BY CAST(bus_date AS DATE) DESC
         LIMIT 1
         """,
         {"brand": source_brand},
@@ -79,7 +79,7 @@ def ec_query_context(
         SELECT 1 AS row_exists
         FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
         WHERE brand_name = :brand
-          AND bus_date BETWEEN :current_start AND :current_end
+          AND CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
         LIMIT 1
         """,
         {
@@ -95,7 +95,7 @@ def ec_query_context(
         SELECT 1 AS row_exists
         FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
         WHERE brand_name = :brand
-          AND bus_date BETWEEN :prior_start AND :prior_end
+          AND CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
         LIMIT 1
         """,
         {
@@ -152,7 +152,7 @@ def filter_sku(
               SUM(unit) AS unit
             FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
             WHERE brand_name = :brand
-              AND bus_date BETWEEN :current_start AND :current_end
+              AND CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
             GROUP BY item_id, key_driver
 
             UNION ALL
@@ -167,7 +167,7 @@ def filter_sku(
               SUM(unit) AS unit
             FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
             WHERE brand_name = :brand
-              AND bus_date BETWEEN :prior_start AND :prior_end
+              AND CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
             GROUP BY item_id, key_driver
         """
         params = {

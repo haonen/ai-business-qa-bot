@@ -9,6 +9,7 @@ from bot.tools.market_common import (
     evol,
     expected_platforms,
     month_slices,
+    date_cast_sql,
     monthly_business_date_sql,
     validate_scope,
 )
@@ -27,10 +28,11 @@ def _lookup(df: pd.DataFrame) -> dict[tuple[str, str, str], dict]:
 
 @tool
 def query_market_trend(period: str, segment: str = "PURE MASS", platform: str = "TTL", view: str = "summary") -> dict:
-    """按月表优先、日表补边界的规则查询Total Beauty大盘及同比。"""
+    """按月表优先、日表补边界的规则查询市场大盘及同比。"""
     try:
         parsed = parse_ec_period(period, 2026)
         segment, platform = validate_scope(segment, platform)
+        is_beauty_market = segment == "BEAUTY MARKET"
         platforms = expected_platforms(platform)
         params = {
             "segment": segment, "current_start": parsed["current_start"], "current_end": parsed["current_end"],
@@ -43,12 +45,17 @@ def query_market_trend(period: str, segment: str = "PURE MASS", platform: str = 
         )
         if any(item["full_month"] for item in all_slices):
             monthly_date = monthly_business_date_sql("bus_date")
+            # Beauty Market is the all-segment total carried by global_segment.
+            # category_EN='Total Beauty' is only a category total within another
+            # segment and must not be used as a substitute for Beauty Market.
+            monthly_category_clause = "" if is_beauty_market else "AND category_EN = 'Total Beauty'"
             monthly = fetch_df(f"""
                 SELECT CASE WHEN {monthly_date} BETWEEN :current_start AND :current_end THEN 'current' ELSE 'prior' END period_key,
                        DATE_FORMAT({monthly_date}, '%Y-%m') source_month, UPPER(TRIM(platform)) platform,
                        COUNT(*) row_count, COALESCE(SUM(gmv), 0) gmv
                 FROM three_platforms_segmented_markets_monthly
-                WHERE UPPER(TRIM(global_segment)) = :segment AND category_EN = 'Total Beauty'
+                WHERE UPPER(TRIM(global_segment)) = :segment
+                  {monthly_category_clause}
                   AND UPPER(TRIM(platform)) IN ({platform_sql})
                   AND ({monthly_date} BETWEEN :current_start AND :current_end
                        OR {monthly_date} BETWEEN :prior_start AND :prior_end)
@@ -56,14 +63,15 @@ def query_market_trend(period: str, segment: str = "PURE MASS", platform: str = 
             """, params)
         else:
             monthly = pd.DataFrame()
+        daily_date = date_cast_sql("bus_date")
         daily = fetch_df(f"""
-            SELECT CASE WHEN bus_date BETWEEN :current_start AND :current_end THEN 'current' ELSE 'prior' END period_key,
-                   DATE_FORMAT(bus_date, '%Y-%m') source_month, UPPER(TRIM(platform)) platform,
+            SELECT CASE WHEN {daily_date} BETWEEN :current_start AND :current_end THEN 'current' ELSE 'prior' END period_key,
+                   DATE_FORMAT({daily_date}, '%Y-%m') source_month, UPPER(TRIM(platform)) platform,
                    COUNT(*) row_count, COALESCE(SUM(gmv), 0) gmv
             FROM three_platforms_segmented_markets_daily
             WHERE UPPER(TRIM(global_segment)) = :segment
               AND UPPER(TRIM(platform)) IN ({platform_sql})
-              AND (bus_date BETWEEN :current_start AND :current_end OR bus_date BETWEEN :prior_start AND :prior_end)
+              AND ({daily_date} BETWEEN :current_start AND :current_end OR {daily_date} BETWEEN :prior_start AND :prior_end)
             GROUP BY period_key, source_month, UPPER(TRIM(platform))
         """, params)
         monthly_lookup, daily_lookup = _lookup(monthly), _lookup(daily)
@@ -135,8 +143,14 @@ def query_market_trend(period: str, segment: str = "PURE MASS", platform: str = 
                                      "evol": evol(cur_value, pri_value) if status == "ok" else None,
                                      "gmv_growth": cur_value - pri_value if status == "ok" else None,
                                      "comparison_status": status})
-        return {"query_meta": {"tool": "query_market_trend", "segment": segment, "category": "Total Beauty", "platform": platform, "view": view,
-                               "monthly_category_rule": "category_EN=Total Beauty", "daily_category_rule": "all categories within segment",
+        return {"query_meta": {"tool": "query_market_trend", "segment": segment,
+                               "category": None if is_beauty_market else "Total Beauty",
+                               "platform": platform, "view": view,
+                               "monthly_scope_rule": (
+                                   "global_segment=Beauty Market" if is_beauty_market
+                                   else "global_segment=<segment> AND category_EN=Total Beauty"
+                               ),
+                               "daily_scope_rule": "global_segment=<segment>",
                                "current_period": [parsed["current_start"], parsed["current_end"]], "prior_period": [parsed["prior_start"], parsed["prior_end"]]},
                 "totals": ttl, "rows": rows, "monthly_rows": monthly_rows, "coverage": selected, "missing": missing,
                 "evidence": [{"metric": r["platform"], "value": r["gmv_actual"]} for r in rows]}

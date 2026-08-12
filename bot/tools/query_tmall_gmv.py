@@ -23,11 +23,11 @@ def query_tmall_gmv(
                 'current' AS period_type,
                 SUM(gmv) AS gmv,
                 COUNT(*) AS row_count,
-                MIN(bus_date) AS min_date,
-                MAX(bus_date) AS max_date
+                MIN(CAST(bus_date AS DATE)) AS min_date,
+                MAX(CAST(bus_date AS DATE)) AS max_date
             FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
             WHERE brand_name = :brand
-              AND bus_date BETWEEN :focus_start AND :focus_end
+              AND CAST(bus_date AS DATE) BETWEEN :focus_start AND :focus_end
 
             UNION ALL
 
@@ -35,11 +35,11 @@ def query_tmall_gmv(
                 'prior' AS period_type,
                 SUM(gmv) AS gmv,
                 COUNT(*) AS row_count,
-                MIN(bus_date) AS min_date,
-                MAX(bus_date) AS max_date
+                MIN(CAST(bus_date AS DATE)) AS min_date,
+                MAX(CAST(bus_date AS DATE)) AS max_date
             FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
             WHERE brand_name = :brand
-              AND bus_date BETWEEN :prior_start AND :prior_end
+              AND CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
             """,
             {
                 "brand": brand,

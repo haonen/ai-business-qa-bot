@@ -63,6 +63,8 @@ class RouteResult:
     platform: str | None = None
     market_view: str | None = None
     ranking_metric: str | None = None
+    ranking_limit: int | None = None
+    preflight_target: str | None = None
     message: str | None = None
     update: FilterUpdate | None = None
 
@@ -102,6 +104,318 @@ def is_media_question(text: str) -> bool:
     lowered = (text or "").lower()
     return any(h.lower() in lowered for h in MEDIA_HINTS) or bool(
         re.search(r"(?<![a-z])tr(?![a-z])", lowered)
+    )
+
+
+def _explicit_business_platform(text: str) -> str | None:
+    lowered = str(text or "").lower()
+    if "天猫" in lowered or bool(re.search(r"(?<![a-z])tmall(?![a-z])|(?<![a-z])tm(?![a-z])", lowered)):
+        return "TM"
+    if "抖音" in lowered or bool(re.search(r"(?<![a-z])dy(?![a-z])", lowered)):
+        return "DY"
+    if "京东" in lowered or bool(re.search(r"(?<![a-z])jd(?![a-z])", lowered)):
+        return "JD"
+    return None
+
+
+def is_business_investment_question(text: str) -> bool:
+    """Brand business/product performance plus BET investment in one request."""
+    lowered = str(text or "").lower()
+    has_business = any(token in lowered for token in (
+        "生意", "主推商品", "商品表现", "产品表现", "gmv", "经营",
+    ))
+    has_investment = is_media_question(text) or any(token in lowered for token in (
+        "投资情况", "投资表现", "投放情况", "投放表现",
+    ))
+    return has_business and has_investment
+
+
+def _is_confirm_reply(text: str) -> bool:
+    value = re.sub(r"[，,。！？!?\s]+", "", str(text or "")).lower()
+    return any(token in value for token in ("确认", "可以", "开始", "继续", "按这个", "按此", "好的", "好", "是的"))
+
+
+def _is_cancel_reply(text: str) -> bool:
+    value = re.sub(r"[，,。！？!?\s]+", "", str(text or "")).lower()
+    return any(token in value for token in ("取消", "不用了", "不分析", "算了"))
+
+
+def _preflight_message(
+    *, target: str, brand: str | None, period: str | None,
+    platform: str | None = None, limit: int | None = None,
+    ranking_metric: str | None = None,
+) -> str:
+    if target == "brand_business_investment_analysis":
+        platform_label = {"TM": "天猫", "DY": "抖音", "JD": "京东"}.get(platform)
+        scope = platform_label or "待确认平台"
+        return (
+            f"这是一个复合分析问题。我理解为：分析{brand or '该品牌'}在{period or '待确认期间'}的"
+            f"{scope}生意与主推商品，同时查看BET媒体投资。\n\n"
+            "**可以回答**\n"
+            "- 所选平台的品牌GMV、同比、品类/渠道及现有商品级表现。\n"
+            "- 同期BET媒体投资、平台/类型结构，以及可用的Search与KOL指标。\n"
+            "- 分别指出生意增长项和投资变化。\n\n"
+            "**不能直接回答**\n"
+            "- 现有数据不能把某笔媒体投资与某个商品GMV逐笔归因，因此不会写“投资导致商品增长”或虚构ROI。\n"
+            "- 数据源缺少的价格、优惠券或促销字段不会推断。\n\n"
+            + (
+                f"如口径正确，请回复“确认”；当前生意平台按{platform_label}执行。"
+                if platform_label else
+                "请回复“天猫，确认”“抖音，确认”或“京东，确认”。"
+            )
+        )
+    metric_label = {
+        "gmv_actual": "本期GMV规模",
+        "gmv_growth": "GMV增长额",
+        "evol": "同比增速",
+    }.get(ranking_metric, "本期GMV规模")
+    return (
+        f"这是一个需要先确认口径的市场深度分析。我理解为：在{period or '待确认期间'}的Pure Mass Beauty中，"
+        f"按TM＋DY＋JD三平台TTL的{metric_label}选Top {limit or 3}，再解释它们如何形成当前排名。\n\n"
+        "**可以回答**\n"
+        "- Top品牌排名、GMV、同比、增长额及三平台结构。\n"
+        "- by month生意节奏，以及现有天猫/抖音商品数据中可验证的主推商品。\n"
+        "- 用平台增量、月份变化和商品增量解释可观察到的排名支撑。\n\n"
+        "**不能直接回答**\n"
+        "- “如何成为Top”只能做数据分解，不能把相关性写成因果。\n"
+        "- 当前缺少统一的京东商品明细、全平台价格/优惠券/促销历史时，不输出相关结论。\n\n"
+        "如口径正确，请回复“确认”；如需改成增长额或同比增速排名，请直接说明。"
+    )
+
+
+def _sophisticated_preflight(text: str, state: SessionState) -> RouteResult | None:
+    if is_business_investment_question(text):
+        brand = detect_brand_hint(text) or state.drilldown_ctx.brand
+        period = extract_period(text) or state.drilldown_ctx.period
+        if not brand:
+            return None
+        platform = _explicit_business_platform(text)
+        return RouteResult(
+            type="clarify_analysis_scope", brand=brand, period=period,
+            brand_aliases=[brand], platform=platform, media_scope="full_bet",
+            preflight_target="brand_business_investment_analysis",
+            message=_preflight_message(
+                target="brand_business_investment_analysis", brand=brand,
+                period=period, platform=platform,
+            ),
+        )
+    if is_market_question(text) and re.search(
+        r"Top\s*\d+.*(?:如何|怎么|为什么|为何)|(?:如何|怎么|为什么|为何).*Top\s*\d+",
+        text, re.IGNORECASE,
+    ):
+        plan = build_market_plan(text)
+        return RouteResult(
+            type="clarify_analysis_scope", period=plan.period,
+            segment=plan.segment, platform=plan.platform,
+            market_view=plan.view, ranking_metric=plan.ranking_metric,
+            ranking_limit=plan.ranking_limit,
+            preflight_target="market_brand_deep_dive",
+            message=_preflight_message(
+                target="market_brand_deep_dive", brand=None, period=plan.period,
+                limit=plan.ranking_limit, ranking_metric=plan.ranking_metric,
+            ),
+        )
+    return None
+
+
+def _resume_analysis_preflight(text: str, pending: dict) -> RouteResult | None:
+    if _is_cancel_reply(text):
+        return RouteResult(type="guide", message="已取消本次分析。")
+    target = str(pending.get("target") or "")
+    platform = _explicit_business_platform(text) or pending.get("platform")
+    metric = str(pending.get("ranking_metric") or "gmv_actual")
+    if any(token in text for token in ("增长额", "增量", "增长Top", "增长top")):
+        metric = "gmv_growth"
+    elif any(token in text for token in ("增速", "涨幅", "同比Top", "同比top")):
+        metric = "evol"
+    elif any(token in text for token in ("规模", "GMV", "gmv")):
+        metric = "gmv_actual"
+    if target == "brand_business_investment_analysis" and not platform:
+        return RouteResult(
+            type="clarify_analysis_scope", brand=pending.get("brand"),
+            period=pending.get("period"), brand_aliases=list(pending.get("brand_aliases") or []),
+            preflight_target=target,
+            message=_preflight_message(
+                target=target, brand=pending.get("brand"), period=pending.get("period"),
+            ),
+        )
+    if _is_confirm_reply(text) or (target == "brand_business_investment_analysis" and platform):
+        return RouteResult(
+            type=target, brand=pending.get("brand"), period=pending.get("period"),
+            brand_aliases=list(pending.get("brand_aliases") or []),
+            platform=platform, segment=pending.get("segment"),
+            market_view=pending.get("market_view"), ranking_metric=metric,
+            ranking_limit=int(pending.get("ranking_limit") or 3), media_scope="full_bet",
+        )
+    return RouteResult(
+        type="clarify_analysis_scope", brand=pending.get("brand"), period=pending.get("period"),
+        brand_aliases=list(pending.get("brand_aliases") or []), platform=platform,
+        segment=pending.get("segment"), market_view=pending.get("market_view"),
+        ranking_metric=metric, ranking_limit=int(pending.get("ranking_limit") or 3),
+        preflight_target=target,
+        message=_preflight_message(
+            target=target, brand=pending.get("brand"), period=pending.get("period"),
+            platform=platform, limit=int(pending.get("ranking_limit") or 3),
+            ranking_metric=metric,
+        ),
+    )
+
+
+def _route_business_investment(text: str, state: SessionState) -> RouteResult:
+    brand = detect_brand_hint(text) or state.drilldown_ctx.brand
+    period = extract_period(text) or state.drilldown_ctx.period
+    if not brand:
+        return RouteResult(type="guide")
+    platform = _explicit_business_platform(text)
+    route_type = "brand_business_investment_analysis" if platform and period else (
+        "clarify_business_platform" if not platform else "clarify_period"
+    )
+    return RouteResult(
+        type=route_type,
+        brand=brand,
+        period=period,
+        brand_aliases=[brand],
+        platform=platform,
+        media_scope="full_bet",
+    )
+
+
+def is_douyin_business_question(text: str) -> bool:
+    lowered = str(text or "").lower()
+    has_platform = "抖音" in lowered or bool(re.search(r"(?<![a-z])dy(?![a-z])", lowered))
+    has_report_intent = any(hint in lowered for hint in (
+        "生意分析", "经营分析", "生意复盘", "经营复盘", "gmv复盘",
+        "品牌复盘", "生意报告", "生意月报", "品牌生意", "生意情况", "经营情况",
+    ))
+    return has_platform and has_report_intent and not is_media_question(text)
+
+
+def is_jd_business_question(text: str) -> bool:
+    lowered = str(text or "").lower()
+    has_platform = "京东" in lowered or bool(re.search(r"(?<![a-z])jd(?![a-z])", lowered))
+    has_report_intent = any(hint in lowered for hint in (
+        "生意分析", "经营分析", "生意复盘", "经营复盘", "gmv复盘",
+        "品牌复盘", "生意报告", "生意月报", "品牌生意", "自营生意",
+        "生意情况", "经营情况",
+        "gmv和品类", "gmv与品类", "品类表现",
+    ))
+    return has_platform and has_report_intent and not is_media_question(text)
+
+
+def is_tmall_business_question(text: str) -> bool:
+    lowered = str(text or "").lower()
+    has_platform = "天猫" in lowered or bool(re.search(r"(?<![a-z])tmall(?![a-z])|(?<![a-z])tm(?![a-z])", lowered))
+    has_business = any(hint in lowered for hint in (
+        "生意", "经营", "gmv", "主推商品", "商品表现", "产品表现",
+    ))
+    return has_platform and has_business and not is_media_question(text) and not is_market_question(text)
+
+
+def _strip_period_syntax(text: str) -> str:
+    """Remove supported raw period spellings before extracting a brand."""
+    value = str(text or "")
+    patterns = (
+        r"(?<!\d)20\d{6}\s*[~～—–\-至到]+\s*20\d{6}(?!\d)",
+        r"(?<!\d)20\d{2}/\d{1,2}/\d{1,2}\s*[~～—–\-至到]+\s*20\d{2}/\d{1,2}/\d{1,2}(?!\d)",
+        r"(?<!\d)20\d{2}-\d{1,2}-\d{1,2}\s*(?:~|～|—|–|至|到|\s-\s)\s*20\d{2}-\d{1,2}-\d{1,2}(?!\d)",
+        r"(?<!\d)20\d{2}\s+\d{1,2}\s*[~～—–\-至到]+\s*\d{1,2}(?:\s*月)?(?!\d)",
+        r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?\s*[~～—–\-至到]+\s*\d{1,2}[日号]?",
+        r"(?:(?:20\d{2})年)?\d{1,2}月?\s*[~～—–\-至到]+\s*(?:(?:20\d{2})年)?\d{1,2}月",
+        r"20\d{2}-\d{1,2}-\d{1,2}",
+        r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?",
+        r"(?:(?:20\d{2})年)?\d{1,2}月",
+        r"(?:(?:20\d{2})年?)?[Qq][1-4]",
+    )
+    for pattern in patterns:
+        value = re.sub(pattern, " ", value)
+    return value
+
+
+def _detect_douyin_business_brand(text: str) -> str | None:
+    candidate = _strip_period_syntax(text)
+    candidate = re.sub(r"(?i)(?<![a-z])dy(?![a-z])|抖音", " ", candidate)
+    candidate = re.sub(
+        r"品牌生意分析报告|品牌生意分析|生意分析报告|生意分析|经营分析|"
+        r"生意复盘|经营复盘|GMV复盘|gmv复盘|品牌复盘|生意报告|生意月报|"
+        r"生意情况|经营情况|生成|输出|报告|品牌|平台",
+        " ",
+        candidate,
+    )
+    candidate = re.sub(r"^\s*(帮我|请|麻烦|看一下|分析一下)\s*", "", candidate)
+    candidate = re.sub(r"(?:(?:在|于|的)\s*)+$", "", candidate)
+    candidate = re.sub(r"[，,。！？!?：:=\s]+", "", candidate)
+    candidate = re.sub(r"(?:在|于|的)$", "", candidate)
+    return candidate if 1 <= len(candidate) <= 30 else None
+
+
+def _detect_jd_business_brand(text: str) -> str | None:
+    candidate = _strip_period_syntax(text)
+    candidate = re.split(r"[，,;；]​?\s*(?:输出|给我|并且|并)", candidate, maxsplit=1)[0]
+    candidate = re.sub(r"(?i)(?<![a-z])jd(?![a-z])|京东", " ", candidate)
+    candidate = re.sub(
+        r"品牌生意分析报告|品牌生意分析|竞品生意分析报告|"
+        r"竞品生意分析|竞品生意报告|自营生意分析|生意分析报告|"
+        r"生意分析|经营分析|"
+        r"生意复盘|经营复盘|GMV复盘|gmv复盘|品牌复盘|"
+        r"生意报告|生意月报|品牌生意|自营生意|"
+        r"生意情况|经营情况|"
+        r"gmv和品类表现|GMV和品类表现|GMV和品类|gmv和品类|GMV与品类|"
+        r"gmv与品类|品类表现|"
+        r"京东自营旗舰店|自营旗舰店|生成|输出|报告|品牌|平台",
+        " ",
+        candidate,
+    )
+    candidate = re.sub(r"^\s*(请做|帮我|请|麻烦|看一下|分析一下|分析|做|看)\s*", "", candidate)
+    candidate = re.sub(r"(?:(?:在|于|的)\s*)+$", "", candidate)
+    candidate = re.sub(r"[，,。！？!?::=\s]+", "", candidate)
+    return candidate if 1 <= len(candidate) <= 30 else None
+
+
+def _route_douyin_business(text: str, state: SessionState) -> RouteResult:
+    brand = _detect_douyin_business_brand(text) or state.drilldown_ctx.brand
+    period = extract_period(text) or state.drilldown_ctx.period
+    if not brand:
+        return RouteResult(type="guide")
+    return RouteResult(
+        type="douyin_business_analysis" if period else "clarify_douyin_period",
+        brand=brand,
+        period=period,
+        brand_aliases=[brand],
+    )
+
+
+def _route_jd_business(text: str, state: SessionState) -> RouteResult:
+    brand = _detect_jd_business_brand(text) or state.drilldown_ctx.brand
+    period = extract_period(text) or state.drilldown_ctx.period
+    if not brand:
+        return RouteResult(type="guide")
+    return RouteResult(
+        type="jd_business_analysis" if period else "clarify_jd_period",
+        brand=brand,
+        period=period,
+        brand_aliases=[brand],
+    )
+
+
+def _route_tmall_business(text: str, state: SessionState) -> RouteResult:
+    candidate = _strip_period_syntax(text)
+    period = extract_period(candidate) or state.drilldown_ctx.period
+    period = extract_period(text) or state.drilldown_ctx.period
+    candidate = re.sub(r"(?i)(?<![a-z])tmall(?![a-z])|(?<![a-z])tm(?![a-z])|天猫", " ", candidate)
+    candidate = re.sub(
+        r"品牌生意分析报告|品牌生意分析|生意分析报告|生意分析|经营分析|"
+        r"生意复盘|经营复盘|GMV复盘|gmv复盘|生意报告|生意月报|"
+        r"生意情况|经营情况|主推商品|商品表现|产品表现|生成|输出|报告|品牌|平台",
+        " ", candidate,
+    )
+    candidate = re.sub(r"^\s*(请做|帮我|请|麻烦|看一下|分析一下|分析|做|看)\s*", "", candidate)
+    candidate = re.sub(r"(?:(?:在|于|的)\s*)+$", "", candidate)
+    brand = re.sub(r"[，,。！？!?：:=\s]+", "", candidate) or state.drilldown_ctx.brand
+    if not brand:
+        return RouteResult(type="guide")
+    return RouteResult(
+        type="default_chain" if period else "clarify_period",
+        brand=brand, period=period, brand_aliases=[brand], platform="TM",
     )
 
 
@@ -200,8 +514,8 @@ def _route_media(text: str, state: SessionState) -> RouteResult:
 def _route_market(text: str, state: SessionState, intent: IntentResult | None = None) -> RouteResult:
     if os.environ.get("MARKET_ANALYSIS_ENABLED", "1") != "1":
         return RouteResult(type="guide")
-    if intent and intent.segment and str(intent.segment).upper() not in {"PURE MASS", "SELECTIVE", "PROFESSIONAL"}:
-        return RouteResult(type="market_parameter_error", message="目前Segment仅支持Pure Mass、Selective和Professional。")
+    if intent and intent.segment and str(intent.segment).upper() not in {"BEAUTY MARKET", "PURE MASS", "SELECTIVE", "PROFESSIONAL"}:
+        return RouteResult(type="market_parameter_error", message="目前Segment仅支持Beauty Market、Pure Mass、Selective和Professional。")
     if intent and intent.platform and str(intent.platform).upper() not in {"TTL", "TM", "DY", "JD"}:
         return RouteResult(type="market_parameter_error", message="目前平台仅支持三平台TTL、天猫、抖音和京东。")
     ctx = state.market_context
@@ -220,6 +534,7 @@ def _route_market(text: str, state: SessionState, intent: IntentResult | None = 
         type=plan.intent if plan.period else "clarify_market_period",
         period=plan.period, segment=plan.segment, platform=plan.platform,
         market_view=plan.view, ranking_metric=plan.ranking_metric,
+        ranking_limit=plan.ranking_limit,
     )
 
 
@@ -275,7 +590,7 @@ def classify_user_intent(user_text: str, state: SessionState) -> IntentResult | 
 - 如果用户没写时间，period 必须为 null；系统会追问，禁止补成618或其他时间。
 - followup 输出 followup_text，去掉开头的“追问：”。
 - market_analysis和market_brand_ranking抽取segment、platform、view、ranking_metric；不得输出表名或SQL。
-- segment只允许PURE MASS、SELECTIVE、PROFESSIONAL；platform只允许TTL、TM、DY、JD。
+- segment只允许BEAUTY MARKET、PURE MASS、SELECTIVE、PROFESSIONAL；用户说Total Beauty Market时输出BEAUTY MARKET；platform只允许TTL、TM、DY、JD。
 - “涨得最好/拉动最大”ranking_metric=gmv_growth；“涨幅/增速最高”ranking_metric=evol。
 - 如果用户没写“追问：”，但说“这个品类/上面/刚才/其中/李佳琦表现呢/T2打法”等，且当前上下文has_context=true，可以判为followup。
 - 没有上下文时，不要把省略品牌和时间的问题判为followup。
@@ -437,6 +752,14 @@ def _route_by_rules(user_text: str, state: SessionState) -> RouteResult:
     ordinal = _ordinal_brand_route(text, state)
     if ordinal:
         return ordinal
+    if is_business_investment_question(text):
+        return _route_business_investment(text, state)
+    if is_jd_business_question(text):
+        return _route_jd_business(text, state)
+    if is_douyin_business_question(text):
+        return _route_douyin_business(text, state)
+    if is_tmall_business_question(text):
+        return _route_tmall_business(text, state)
     if is_market_question(text):
         return _route_market(text, state)
     if text.startswith("追问：") or text.startswith("追问:"):
@@ -472,13 +795,44 @@ def route(user_text: str, state: SessionState) -> RouteResult:
     # BET仍是独立报告入口，但品牌、时间和中英文名优先由统一语义路由抽取。
     is_explicit_media = is_media_question(text)
     pending_period = extract_period(text)
-    if state.pending_request and state.pending_request.get("intent") in {"market_analysis", "market_brand_ranking"} and pending_period:
+    if state.pending_request and state.pending_request.get("intent") == "analysis_preflight":
+        resumed = _resume_analysis_preflight(text, state.pending_request)
+        if resumed:
+            return resumed
+    if state.pending_request and state.pending_request.get("intent") == "brand_business_investment_analysis":
+        pending = state.pending_request
+        selected_platform = _explicit_business_platform(text) or pending.get("platform")
+        selected_period = pending_period or pending.get("period")
+        if selected_platform and selected_period:
+            return RouteResult(
+                type="brand_business_investment_analysis",
+                brand=pending.get("brand"),
+                period=selected_period,
+                brand_aliases=list(pending.get("brand_aliases") or []),
+                platform=selected_platform,
+                media_scope="full_bet",
+            )
+    if state.pending_request and state.pending_request.get("intent") == "jd_business_analysis" and pending_period:
+        return RouteResult(
+            type="jd_business_analysis",
+            brand=state.pending_request.get("brand"),
+            period=pending_period,
+            brand_aliases=list(state.pending_request.get("brand_aliases") or []),
+        )
+    if state.pending_request and state.pending_request.get("intent") == "douyin_business_analysis" and pending_period:
+        return RouteResult(
+            type="douyin_business_analysis",
+            brand=state.pending_request.get("brand"),
+            period=pending_period,
+            brand_aliases=list(state.pending_request.get("brand_aliases") or []),
+        )
+    if state.pending_request and state.pending_request.get("intent") in {"market_analysis", "market_brand_ranking", "market_brand_deep_dive"} and pending_period:
         pending = state.pending_request
         return RouteResult(
             type=pending["intent"], period=pending_period,
             segment=pending.get("segment") or "PURE MASS", platform=pending.get("platform") or "TTL",
             market_view=pending.get("market_view") or "summary",
-            ranking_metric=pending.get("ranking_metric") or "gmv_growth",
+            ranking_metric=pending.get("ranking_metric") or "gmv_actual",
         )
     if state.pending_request and state.pending_request.get("intent") == "followup_v2":
         awaiting = state.pending_request.get("awaiting")
@@ -529,6 +883,22 @@ def route(user_text: str, state: SessionState) -> RouteResult:
             brand_aliases=list(ctx.brand_aliases or state.drilldown_ctx.brand_aliases),
             followup_text=followup,
         )
+
+    if is_jd_business_question(text):
+        return _route_jd_business(text, state)
+
+    if is_douyin_business_question(text):
+        return _route_douyin_business(text, state)
+
+    if is_tmall_business_question(text):
+        return _route_tmall_business(text, state)
+
+    preflight = _sophisticated_preflight(text, state)
+    if preflight:
+        return preflight
+
+    if is_business_investment_question(text):
+        return _route_business_investment(text, state)
 
     # 明确的大盘问句走确定性快速路径，避免为已能完整解析的日期、Segment和平台
     # 等待路由模型；含糊的非大盘问句仍由统一语义路由处理。

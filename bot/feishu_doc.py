@@ -7,7 +7,7 @@ feishu_doc.py — 生成飞书云文档，写入分析报告
   - drive:drive 或 docs:doc（设置链接分享权限）
 """
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 import lark_oapi as lark
 import requests
@@ -32,6 +32,43 @@ from lark_oapi.api.drive.v1 import (
     PermissionPublicRequest,
     PatchPermissionPublicRequest,
 )
+
+
+_DOC_RETRY_ATTEMPTS = 4
+_DOC_RETRY_BASE_SECONDS = 0.8
+
+
+def _retryable_doc_response(resp) -> bool:
+    code = str(getattr(resp, "code", "") or "")
+    message = str(getattr(resp, "msg", "") or "").casefold()
+    return code == "1771001" or any(
+        marker in message
+        for marker in ("internal error", "rate", "frequency", "too many", "busy")
+    )
+
+
+def _doc_call_with_retry(call, label: str, attempts: int = _DOC_RETRY_ATTEMPTS):
+    """Retry transient Feishu Docx failures, including empty 429 responses."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = call()
+            if response.success() or not _retryable_doc_response(response):
+                return response
+            last_error = RuntimeError(
+                f"{label} failed [{getattr(response, 'code', '')}]: {getattr(response, 'msg', '')}"
+            )
+        except Exception as exc:
+            # The Lark SDK raises JSONDecodeError when a 429 response body is empty.
+            last_error = exc
+        if attempt + 1 < attempts:
+            delay = _DOC_RETRY_BASE_SECONDS * (2 ** attempt)
+            lark.logger.warning(
+                f"[doc] transient {label} failure, retry {attempt + 1}/{attempts - 1} "
+                f"after {delay:.1f}s: {last_error}"
+            )
+            time.sleep(delay)
+    raise RuntimeError(f"{label} failed after {attempts} attempts: {last_error}") from last_error
 
 
 # ── Block builders ────────────────────────────────────────────────────────────
@@ -231,31 +268,38 @@ def _write_sheet_table(client: lark.Client, doc_id: str, headers: list, rows: li
         .build()
     )
 
-    resp = client.docx.v1.document_block_children.create(
-        CreateDocumentBlockChildrenRequest.builder()
-        .document_id(doc_id)
-        .block_id(doc_id)
-        .request_body(
-            CreateDocumentBlockChildrenRequestBody.builder().children([sheet_block]).build()
+    try:
+        resp = _doc_call_with_retry(
+            lambda: client.docx.v1.document_block_children.create(
+                CreateDocumentBlockChildrenRequest.builder()
+                .document_id(doc_id)
+                .block_id(doc_id)
+                .request_body(
+                    CreateDocumentBlockChildrenRequestBody.builder().children([sheet_block]).build()
+                )
+                .build()
+            ),
+            "create sheet block",
         )
-        .build()
-    )
+    except Exception as exc:
+        lark.logger.warning(f"[doc] create sheet block exhausted retries ({exc}); using text fallback")
+        return _table_text_fallback(headers, rows)
     if not resp.success():
         lark.logger.warning(f"[doc] create sheet block failed [{resp.code}]: {resp.msg}")
-        return _write_table(client, doc_id, headers, rows) or _table_text_fallback(headers, rows)
+        return _table_text_fallback(headers, rows)
 
     created = (resp.data.children or [None])[0]
     token = getattr(getattr(created, "sheet", None), "token", None)
     if not token:
         lark.logger.warning("[doc] sheet block created without sheet token")
-        return _write_table(client, doc_id, headers, rows) or _table_text_fallback(headers, rows)
+        return _table_text_fallback(headers, rows)
 
     try:
         spreadsheet_token, sheet_id = _split_sheet_token(token)
         _write_sheet_values(client, spreadsheet_token, sheet_id, values)
     except Exception as e:
         lark.logger.warning(f"[doc] write sheet values failed ({e})")
-        return _write_table(client, doc_id, headers, rows) or _table_text_fallback(headers, rows)
+        return _table_text_fallback(headers, rows)
 
     lark.logger.info(f"[doc] embedded sheet table written ({row_count}x{col_count})")
     return None
@@ -329,14 +373,17 @@ def _write_table(client: lark.Client, doc_id: str, headers: list, rows: list):
     tbl = Table.builder().property(prop).build()
     tbl_block = Block.builder().block_type(31).table(tbl).build()
 
-    resp = client.docx.v1.document_block_children.create(
-        CreateDocumentBlockChildrenRequest.builder()
-        .document_id(doc_id)
-        .block_id(doc_id)
-        .request_body(
-            CreateDocumentBlockChildrenRequestBody.builder().children([tbl_block]).build()
-        )
-        .build()
+    resp = _doc_call_with_retry(
+        lambda: client.docx.v1.document_block_children.create(
+            CreateDocumentBlockChildrenRequest.builder()
+            .document_id(doc_id)
+            .block_id(doc_id)
+            .request_body(
+                CreateDocumentBlockChildrenRequestBody.builder().children([tbl_block]).build()
+            )
+            .build()
+        ),
+        "create native table",
     )
     if not resp.success():
         lark.logger.warning(f"[doc] create table failed [{resp.code}] — using text fallback")
@@ -375,26 +422,28 @@ def _write_table(client: lark.Client, doc_id: str, headers: list, rows: list):
             _make_text([_run(value, bold=is_header)])
         ).build()
 
-        r = client.docx.v1.document_block_children.create(
-            CreateDocumentBlockChildrenRequest.builder()
-            .document_id(doc_id)
-            .block_id(cell_ids[idx])
-            .request_body(
-                CreateDocumentBlockChildrenRequestBody.builder().children([text_block]).build()
-            )
-            .build()
+        r = _doc_call_with_retry(
+            lambda: client.docx.v1.document_block_children.create(
+                CreateDocumentBlockChildrenRequest.builder()
+                .document_id(doc_id)
+                .block_id(cell_ids[idx])
+                .request_body(
+                    CreateDocumentBlockChildrenRequestBody.builder().children([text_block]).build()
+                )
+                .build()
+            ),
+            f"write table cell {idx}",
         )
         if not r.success():
             errors.append(f"cell {idx}: {r.code}")
 
     total = min(len(cell_ids), row_count * col_count)
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = [ex.submit(write_one, i) for i in range(total)]
-        for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                errors.append(str(e))
+    for idx in range(total):
+        try:
+            write_one(idx)
+        except Exception as exc:
+            errors.append(str(exc))
+        time.sleep(0.12)
 
     if errors:
         lark.logger.warning(f"[doc] {len(errors)} cell write errors: {errors[:3]}")
@@ -541,17 +590,20 @@ def _flush_blocks(client: lark.Client, doc_id: str, blocks: list):
     BATCH = 50
     for start in range(0, len(blocks), BATCH):
         batch = blocks[start : start + BATCH]
-        wr = client.docx.v1.document_block_children.create(
-            CreateDocumentBlockChildrenRequest.builder()
-            .document_id(doc_id)
-            .block_id(doc_id)
-            .request_body(
-                CreateDocumentBlockChildrenRequestBody.builder().children(batch).build()
-            )
-            .build()
+        wr = _doc_call_with_retry(
+            lambda: client.docx.v1.document_block_children.create(
+                CreateDocumentBlockChildrenRequest.builder()
+                .document_id(doc_id)
+                .block_id(doc_id)
+                .request_body(
+                    CreateDocumentBlockChildrenRequestBody.builder().children(batch).build()
+                )
+                .build()
+            ),
+            "flush document blocks",
         )
         if not wr.success():
-            lark.logger.error(f"[doc] flush blocks failed [{wr.code}]: {wr.msg}")
+            raise RuntimeError(f"Flush blocks failed [{wr.code}]: {wr.msg}")
 
 
 # ── Document creation ─────────────────────────────────────────────────────────
@@ -568,10 +620,13 @@ def create_feishu_doc(client: lark.Client, title: str, markdown_content: str) ->
     Required app permissions: docx:document, drive:drive, sheets:spreadsheet
     """
     # Step 1: Create the document
-    create_resp = client.docx.v1.document.create(
-        CreateDocumentRequest.builder()
-        .request_body(CreateDocumentRequestBody.builder().title(title).build())
-        .build()
+    create_resp = _doc_call_with_retry(
+        lambda: client.docx.v1.document.create(
+            CreateDocumentRequest.builder()
+            .request_body(CreateDocumentRequestBody.builder().title(title).build())
+            .build()
+        ),
+        "create document",
     )
     if not create_resp.success():
         raise Exception(f"Create doc failed [{create_resp.code}]: {create_resp.msg}")

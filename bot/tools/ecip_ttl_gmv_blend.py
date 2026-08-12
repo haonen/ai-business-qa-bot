@@ -6,7 +6,7 @@ from typing import Callable
 
 import pandas as pd
 
-from bot.tools.market_common import monthly_business_date_sql
+from bot.tools.market_common import date_cast_sql, monthly_business_date_sql
 
 
 _TTL_CATEGORY_SQL = "'Skincare', 'Hair', 'Makeup + Fragrance', 'Makeup+Fragrance'"
@@ -57,6 +57,7 @@ def query_blended_tmall_ttl_gmv(
 ) -> dict:
     """Use monthly data for complete available months and daily data elsewhere."""
     monthly_date = monthly_business_date_sql("bus_date")
+    daily_date = date_cast_sql("bus_date")
     monthly_sql = f"""
         SELECT
           CASE WHEN {monthly_date} BETWEEN :current_start_iso AND :current_end_iso
@@ -76,21 +77,21 @@ def query_blended_tmall_ttl_gmv(
     """
     daily_sql = f"""
         SELECT
-          CASE WHEN bus_date BETWEEN :current_start_slash AND :current_end_slash
+          CASE WHEN {daily_date} BETWEEN :current_start_iso AND :current_end_iso
                THEN 'current' ELSE 'prior' END AS period_key,
-          DATE_FORMAT(STR_TO_DATE(bus_date, '%Y/%m/%d'), '%Y-%m') AS source_month,
+          DATE_FORMAT({daily_date}, '%Y-%m') AS source_month,
           COUNT(*) AS row_count,
           COALESCE(SUM(CAST(REPLACE(NULLIF(TRIM(gmv), ''), ',', '')
             AS DECIMAL(24, 4))), 0) AS gmv
         FROM tmall_store_ranking_day_jiashicang
         WHERE brand_name = :brand
           AND (
-            bus_date BETWEEN :current_start_slash AND :current_end_slash
-            OR bus_date BETWEEN :prior_start_slash AND :prior_end_slash
+            {daily_date} BETWEEN :current_start_iso AND :current_end_iso
+            OR {daily_date} BETWEEN :prior_start_iso AND :prior_end_iso
           )
           AND category_EN_level_1 IN ({_TTL_CATEGORY_SQL})
         GROUP BY period_key,
-          DATE_FORMAT(STR_TO_DATE(bus_date, '%Y/%m/%d'), '%Y-%m')
+          DATE_FORMAT({daily_date}, '%Y-%m')
     """
     params = {
         "brand": brand,
@@ -98,10 +99,6 @@ def query_blended_tmall_ttl_gmv(
         "current_end_iso": current_end,
         "prior_start_iso": prior_start,
         "prior_end_iso": prior_end,
-        "current_start_slash": current_start.replace("-", "/"),
-        "current_end_slash": current_end.replace("-", "/"),
-        "prior_start_slash": prior_start.replace("-", "/"),
-        "prior_end_slash": prior_end.replace("-", "/"),
     }
     monthly_lookup = _to_lookup(fetcher(monthly_sql, params))
     daily_lookup = _to_lookup(fetcher(daily_sql, params))

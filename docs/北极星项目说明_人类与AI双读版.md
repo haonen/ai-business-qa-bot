@@ -378,6 +378,7 @@ Tool 应保持以下约定：
 
 - SQL 由程序固定维护，参数使用 SQLAlchemy 绑定；
 - 不接收 LLM 生成的 SQL；
+- 日期值统一按`YYYY-MM-DD`解释；凡SQL涉及日期筛选、排序、分组或覆盖判断，均先对该表的实际日期字段执行`CAST(字段 AS DATE)`；
 - 追问 Tool 统一返回 `query_meta`、`filters`、`totals`、`rows`、`coverage`、`missing` 和 `evidence`；
 - 缺失月份保留为缺失，不补零、不插值；
 - 同比、份额、CPE、费比和贡献度在 Python/SQL 中计算，不交给 LLM 心算。

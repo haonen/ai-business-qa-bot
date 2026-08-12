@@ -144,6 +144,17 @@ def parse_ec_period(period: str, default_year: int) -> dict[str, Any]:
 
 
 def _parse_ec_date_range(value: str, default_year: int) -> tuple[date, date]:
+    quarter = re.fullmatch(r"(?:(20\d{2})年?)?[Qq]([1-4])", value)
+    if quarter:
+        year = int(quarter.group(1) or default_year)
+        quarter_number = int(quarter.group(2))
+        start_month = (quarter_number - 1) * 3 + 1
+        end_month = start_month + 2
+        return (
+            date(year, start_month, 1),
+            date(year, end_month, calendar.monthrange(year, end_month)[1]),
+        )
+
     single_iso_date = re.fullmatch(r"(20\d{2})-(\d{1,2})-(\d{1,2})", value)
     if single_iso_date:
         selected = date(
@@ -152,6 +163,19 @@ def _parse_ec_date_range(value: str, default_year: int) -> tuple[date, date]:
             int(single_iso_date.group(3)),
         )
         return selected, selected
+
+    same_month_dates = re.fullmatch(
+        r"(?:(20\d{2})年)?(\d{1,2})月(\d{1,2})[日号]?\s*[~～—–\-至到]+\s*"
+        r"(\d{1,2})[日号]?",
+        value,
+    )
+    if same_month_dates:
+        year = int(same_month_dates.group(1) or default_year)
+        month = int(same_month_dates.group(2))
+        return (
+            date(year, month, int(same_month_dates.group(3))),
+            date(year, month, int(same_month_dates.group(4))),
+        )
 
     single_cn_date = re.fullmatch(
         r"(?:(20\d{2})年)?(\d{1,2})月(\d{1,2})[日号]?",
@@ -369,12 +393,60 @@ def detect_brand_hint(text: str) -> str | None:
 
 def normalize_period_hint(text: str) -> str | None:
     text = text.strip()
+    quarter = re.search(r"(?:(?:20\d{2})年?)?[Qq][1-4]", text)
+    if quarter:
+        return quarter.group(0)
+    # Compact full dates: 20260101-20260328.
+    compact = re.search(
+        r"(?<!\d)(20\d{2})(\d{2})(\d{2})\s*[~～—–\-至到]+\s*"
+        r"(20\d{2})(\d{2})(\d{2})(?!\d)",
+        text,
+    )
+    if compact:
+        try:
+            start = date(*map(int, compact.groups()[:3]))
+            end = date(*map(int, compact.groups()[3:]))
+            return f"{start.isoformat()}~{end.isoformat()}"
+        except ValueError:
+            return None
+    # Slash full dates: 2026/1/1 - 2026/3/28.
+    slash = re.search(
+        r"(?<!\d)(20\d{2})/(\d{1,2})/(\d{1,2})\s*[~～—–\-至到]+\s*"
+        r"(20\d{2})/(\d{1,2})/(\d{1,2})(?!\d)",
+        text,
+    )
+    if slash:
+        try:
+            start = date(*map(int, slash.groups()[:3]))
+            end = date(*map(int, slash.groups()[3:]))
+            return f"{start.isoformat()}~{end.isoformat()}"
+        except ValueError:
+            return None
+    # Flexible ISO full dates, including 2026-1-1 - 2026-03-28.
+    full_flexible = re.search(
+        r"(?<!\d)(20\d{2})-(\d{1,2})-(\d{1,2})\s*(?:~|～|—|–|至|到|\s-\s)\s*"
+        r"(20\d{2})-(\d{1,2})-(\d{1,2})(?!\d)",
+        text,
+    )
+    if full_flexible:
+        try:
+            start = date(*map(int, full_flexible.groups()[:3]))
+            end = date(*map(int, full_flexible.groups()[3:]))
+            return f"{start.isoformat()}~{end.isoformat()}"
+        except ValueError:
+            return None
     full = re.search(r"\d{4}-\d{2}-\d{2}[~\-至到]+\d{4}-\d{2}-\d{2}", text)
     if full:
         return full.group(0).replace("到", "~").replace("至", "~")
     md = re.search(r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?[~\-至到]+(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?", text)
     if md:
         return md.group(0)
+    same_month_dates = re.search(
+        r"(?:(?:20\d{2})年)?\d{1,2}月\d{1,2}[日号]?[~～—–\-至到]+\d{1,2}[日号]?",
+        text,
+    )
+    if same_month_dates:
+        return same_month_dates.group(0)
     single_iso_date = re.search(r"20\d{2}-\d{1,2}-\d{1,2}(?!\d)", text)
     if single_iso_date:
         return single_iso_date.group(0)
@@ -387,6 +459,14 @@ def normalize_period_hint(text: str) -> str | None:
     )
     if iso_month_range:
         return iso_month_range.group(0)
+    spaced_year_month_range = re.search(
+        r"(?<!\d)(20\d{2})\s+(\d{1,2})\s*[~～—–\-至到]+\s*(\d{1,2})(?:\s*月)?(?!\d)",
+        text,
+    )
+    if spaced_year_month_range:
+        year, start_month, end_month = spaced_year_month_range.groups()
+        if 1 <= int(start_month) <= 12 and 1 <= int(end_month) <= 12:
+            return f"{year}年{int(start_month)}-{int(end_month)}月"
     cn_month_range = re.search(
         r"(?:(?:20\d{2})年)?\d{1,2}月?[~～—–\-至到]+(?:(?:20\d{2})年)?\d{1,2}月",
         text,

@@ -116,7 +116,7 @@ def query_kol_performance(
             """
             SELECT
                 year,
-                period_month,
+                CAST(period_month AS DATE) AS period_month,
                 tier,
                 kol_type,
                 SUM(big_v_cost) AS cost,
@@ -126,10 +126,10 @@ def query_kol_performance(
             WHERE brand = :brand
               AND LOWER(platform) = :platform
               AND (
-                period_month BETWEEN :focus_start AND :focus_end
-                OR period_month BETWEEN :prior_start AND :prior_end
+                CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end
+                OR CAST(period_month AS DATE) BETWEEN :prior_start AND :prior_end
               )
-            GROUP BY year, period_month, tier, kol_type
+            GROUP BY year, CAST(period_month AS DATE), tier, kol_type
             """,
             {
                 "brand": brand,
@@ -149,8 +149,8 @@ def query_kol_performance(
                 FROM ai_bot_media_ksi_performance
                 WHERE brand = :brand
                   AND (
-                    period_month BETWEEN :focus_start AND :focus_end
-                    OR period_month BETWEEN :prior_start AND :prior_end
+                    CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end
+                    OR CAST(period_month AS DATE) BETWEEN :prior_start AND :prior_end
                   )
                 GROUP BY year
                 """,
@@ -213,7 +213,7 @@ def query_kol_performance(
             FROM ai_bot_media_ksi_performance
             WHERE brand = :brand
               AND LOWER(platform) = :platform
-              AND period_month BETWEEN :focus_start AND :focus_end
+              AND CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end
             GROUP BY COALESCE(
                 NULLIF(TRIM(kol_id_front), ''),
                 CONCAT('nickname:', COALESCE(NULLIF(TRIM(nickname), ''), '未知KOL'))

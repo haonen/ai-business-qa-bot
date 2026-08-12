@@ -59,14 +59,14 @@ def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tupl
     df = fetch_df(
         """
         SELECT
-          CASE WHEN period_month BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
-          period_month, ait_roe AS ait, media, submedia,
+          CASE WHEN CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
+          CAST(period_month AS DATE) AS period_month, ait_roe AS ait, media, submedia,
           bkfs_overall, bkfs_xiaohongshu, bkfs_douyin,
           SUM(spend_million) * 1000000 AS spend, COUNT(*) AS row_count
         FROM ai_bot_media_topline_investment
         WHERE brand_r = :brand
-          AND (period_month BETWEEN :focus_start AND :focus_end OR period_month BETWEEN :prior_start AND :prior_end)
-        GROUP BY period_key, period_month, ait_roe, media, submedia, bkfs_overall, bkfs_xiaohongshu, bkfs_douyin
+          AND (CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end OR CAST(period_month AS DATE) BETWEEN :prior_start AND :prior_end)
+        GROUP BY period_key, CAST(period_month AS DATE), ait_roe, media, submedia, bkfs_overall, bkfs_xiaohongshu, bkfs_douyin
         """,
         {"brand": brand, "focus_start": parsed.focus_start, "focus_end": parsed.focus_end,
          "prior_start": parsed.prior_start, "prior_end": parsed.prior_end},
@@ -130,6 +130,7 @@ def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tupl
     coverage = {
         "current_months": sorted(df.loc[df["period_key"] == "current", "month"].unique().tolist()),
         "prior_months": sorted(df.loc[df["period_key"] == "prior", "month"].unique().tolist()),
+        "source_current_months": sorted(raw.loc[raw["period_key"] == "current", "month"].unique().tolist()),
     }
     return rows, totals, coverage
 
@@ -154,12 +155,12 @@ def _query_nso(brand: str, parsed) -> pd.DataFrame:
 def _query_search(brand: str, parsed, group_by: list[str]) -> tuple[list[dict], dict, dict]:
     df = fetch_df(
         """
-        SELECT report_month, grain_level, category,
+        SELECT CAST(report_month AS DATE) AS report_month, grain_level, category,
                current_search_index AS search_actual, previous_search_index AS search_prior,
                COUNT(*) AS row_count
         FROM ai_bot_media_search_index
-        WHERE brand=:brand AND report_month BETWEEN :start_month AND :end_month
-        GROUP BY report_month, grain_level, category, current_search_index, previous_search_index
+        WHERE brand=:brand AND CAST(report_month AS DATE) BETWEEN :start_month AND :end_month
+        GROUP BY CAST(report_month AS DATE), grain_level, category, current_search_index, previous_search_index
         """,
         {"brand": brand, "start_month": parsed.focus_start, "end_month": parsed.focus_end},
     )
@@ -180,13 +181,13 @@ def _query_search(brand: str, parsed, group_by: list[str]) -> tuple[list[dict], 
 def _query_kol(brand: str, parsed, group_by: list[str], filters: dict) -> tuple[list[dict], dict, dict]:
     df = fetch_df(
         """
-        SELECT CASE WHEN period_month BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
-               period_month, LOWER(platform) AS kol_platform, tier, kol_type,
+        SELECT CASE WHEN CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
+               CAST(period_month AS DATE) AS period_month, LOWER(platform) AS kol_platform, tier, kol_type,
                COALESCE(NULLIF(TRIM(nickname), ''), NULLIF(TRIM(kol_id_front), ''), '未知KOL') AS kol,
                SUM(big_v_cost) AS cost, SUM(COALESCE(ttl_engagement,0)) AS engage, COUNT(*) AS row_count
         FROM ai_bot_media_ksi_performance
-        WHERE brand=:brand AND (period_month BETWEEN :focus_start AND :focus_end OR period_month BETWEEN :prior_start AND :prior_end)
-        GROUP BY period_key, period_month, LOWER(platform), tier, kol_type,
+        WHERE brand=:brand AND (CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end OR CAST(period_month AS DATE) BETWEEN :prior_start AND :prior_end)
+        GROUP BY period_key, CAST(period_month AS DATE), LOWER(platform), tier, kol_type,
                  COALESCE(NULLIF(TRIM(nickname), ''), NULLIF(TRIM(kol_id_front), ''), '未知KOL')
         """,
         {"brand": brand, "focus_start": parsed.focus_start, "focus_end": parsed.focus_end,
@@ -250,6 +251,31 @@ def query_bet_followup_table(
             rows, totals, coverage = _query_kol(matched_brand, parsed, group_by, filters)
         else:
             rows, totals, coverage = _query_media(matched_brand, parsed, group_by, filters)
+            requested = month_keys(parsed.focus_start, parsed.focus_end)
+            source_current_months = coverage.get("source_current_months") or coverage.get("current_months") or []
+            missing_current_months = [
+                month for month in requested if month not in source_current_months
+            ]
+            if missing_current_months:
+                missing_text = "、".join(f"{int(month[-2:])}月" for month in missing_current_months)
+                latest_text = (
+                    f"，当前最新可用月份为{int(source_current_months[-1][-2:])}月"
+                    if source_current_months
+                    else ""
+                )
+                return {
+                    "error": "requested_period_incomplete",
+                    "message": (
+                        f"Topline的BET花费数据尚未覆盖{missing_text}{latest_text}。"
+                        "为避免把部分月份累计值误当成完整区间，"
+                        "本次不返回该时间段的BET花费数字。"
+                    ),
+                    "coverage": {
+                        **coverage,
+                        "requested_months": requested,
+                        "missing_current_months": missing_current_months,
+                    },
+                }
             if any(m in metrics for m in ("nso_actual", "nso_evol", "fee_ratio", "fee_ratio_change")):
                 nso_brand = source_brands.get("nso")
                 nso = _query_nso(nso_brand, parsed) if nso_brand else pd.DataFrame()

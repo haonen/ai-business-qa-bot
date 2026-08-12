@@ -144,8 +144,10 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
 
         route_type = result.get("route_type")
         report_meta = result.get("meta", {})
-        market_document = route_type in {"market_analysis", "market_brand_ranking"}
-        brand_document = route_type in {"default_chain", "media_analysis", "skill_dispatch"} and report_meta.get("brand")
+        market_document = route_type in {"market_analysis", "market_brand_ranking", "market_brand_deep_dive"}
+        brand_document = route_type in {
+            "default_chain", "brand_business_investment_analysis", "douyin_business_analysis", "jd_business_analysis", "media_analysis", "skill_dispatch"
+        } and report_meta.get("brand")
         if (market_document or brand_document) and report_meta.get("document_ready", True):
             import bot.feishu_doc as feishu_doc
 
@@ -155,14 +157,31 @@ def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
                 doc_title = result["meta"].get("document_title") or f"{period} 大盘分析"
             elif route_type == "skill_dispatch":
                 doc_title = result["meta"].get("document_title") or f"{brand} {period} 数据分析"
+            elif route_type == "brand_business_investment_analysis":
+                doc_title = result["meta"].get("document_title") or f"{brand} {period} 生意与BET投资联合分析"
             elif route_type == "media_analysis":
                 period_title = result["meta"].get("period_display") or period
                 doc_title = f"{brand} {period_title} BET媒体投资分析报告"
+            elif route_type == "douyin_business_analysis":
+                doc_title = f"{brand} {period} 抖音生意分析报告"
+            elif route_type == "jd_business_analysis":
+                doc_title = f"{brand} {period} 京东品牌生意分析"
             else:
                 doc_title = f"{brand} {period} 生意分析报告"
             on_progress("正在生成分析报告文档…")
-            doc_url = feishu_doc.create_feishu_doc(cli, doc_title, markdown)
-            _update_text(placeholder_id, f"已生成「{doc_title}」分析报告：{doc_url}")
+            try:
+                doc_url = feishu_doc.create_feishu_doc(cli, doc_title, markdown)
+                _update_text(placeholder_id, f"已生成「{doc_title}」分析报告：{doc_url}")
+            except Exception as doc_exc:
+                lark.logger.exception(f"document generation failed: {doc_exc}")
+                _update_text(
+                    placeholder_id,
+                    "数据分析已完成，但飞书文档服务暂时限流。已将结果直接发送到当前会话，请稍后重试生成文档。",
+                )
+                try:
+                    _send_reply(message.chat_id, markdown)
+                except Exception as reply_exc:
+                    lark.logger.exception(f"analysis fallback reply failed: {reply_exc}")
         else:
             _update_text(placeholder_id, "已完成，结果如下：")
             _send_reply(message.chat_id, markdown)

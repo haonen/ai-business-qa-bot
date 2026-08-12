@@ -797,17 +797,17 @@ def resolve_source_brand(
 def latest_common_month(resolved: dict[str, str | None]) -> str | None:
     queries = {
         "search": """
-            SELECT DISTINCT DATE_FORMAT(report_month, '%%Y-%%m-01') AS month_value
+            SELECT DISTINCT DATE_FORMAT(CAST(report_month AS DATE), '%%Y-%%m-01') AS month_value
             FROM ai_bot_media_search_index
             WHERE report_year = 2026 AND brand = :brand
         """,
         "topline": """
-            SELECT DISTINCT DATE_FORMAT(period_month, '%%Y-%%m-01') AS month_value
+            SELECT DISTINCT DATE_FORMAT(CAST(period_month AS DATE), '%%Y-%%m-01') AS month_value
             FROM ai_bot_media_topline_investment
             WHERE year = 2026 AND brand_r = :brand
         """,
         "ksi": """
-            SELECT DISTINCT DATE_FORMAT(period_month, '%%Y-%%m-01') AS month_value
+            SELECT DISTINCT DATE_FORMAT(CAST(period_month AS DATE), '%%Y-%%m-01') AS month_value
             FROM ai_bot_media_ksi_performance
             WHERE year = 2026 AND brand = :brand
         """,

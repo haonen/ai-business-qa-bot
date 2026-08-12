@@ -18,17 +18,17 @@ def query_douyin_gmv(
         df = fetch_df(
             """
             SELECT
-                CASE WHEN `业务日期` BETWEEN :focus_start AND :focus_end
+                CASE WHEN CAST(`业务日期` AS DATE) BETWEEN :focus_start AND :focus_end
                      THEN 'current' ELSE 'prior' END AS period_type,
                 SUM(`销售额`) AS gmv,
                 COUNT(*) AS row_count,
-                MIN(`业务日期`) AS min_date,
-                MAX(`业务日期`) AS max_date
+                MIN(CAST(`业务日期` AS DATE)) AS min_date,
+                MAX(CAST(`业务日期` AS DATE)) AS max_date
             FROM ai_bot_dy_product_link
             WHERE `商品品牌` = :brand
               AND (
-                `业务日期` BETWEEN :focus_start AND :focus_end
-                OR `业务日期` BETWEEN :prior_start AND :prior_end
+                CAST(`业务日期` AS DATE) BETWEEN :focus_start AND :focus_end
+                OR CAST(`业务日期` AS DATE) BETWEEN :prior_start AND :prior_end
               )
             GROUP BY period_type
             """,

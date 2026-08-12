@@ -194,6 +194,20 @@ def run_media_chain(
     red_result = results["red"]
     douyin_result = results["douyin"]
 
+    if investment_result.get("error") == "requested_period_incomplete":
+        return {
+            "ok": False,
+            "markdown": investment_result["message"],
+            "meta": {
+                "brand": brand,
+                "period": parsed.canonical,
+                "period_display": parsed.display,
+                "report_type": "media_analysis",
+                "document_ready": False,
+                "coverage": investment_result.get("coverage") or {},
+            },
+        }
+
     if on_progress:
         on_progress("正在生成BET媒体投资飞书报告…")
     markdown = format_media_report(

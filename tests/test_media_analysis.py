@@ -8,7 +8,7 @@ import pandas as pd
 
 from bot.chains.media_chain import run_media_chain
 from bot.chains.default_chain import run_default_chain
-from bot.feishu_doc import _compact_wide_table, markdown_to_items
+from bot.feishu_doc import _compact_wide_table, _doc_call_with_retry, markdown_to_items
 from bot.media_formatter import (
     _dimension_bullets,
     _mix_bullets,
@@ -48,7 +48,32 @@ class MediaPeriodTest(unittest.TestCase):
         self.assertEqual(parsed.display, "2026年1–4月")
 
 
+class FeishuDocRetryTest(unittest.TestCase):
+    @patch("bot.feishu_doc.time.sleep")
+    def test_empty_rate_limit_response_is_retried(self, sleep):
+        success = MagicMock()
+        success.success.return_value = True
+        call = MagicMock(side_effect=[ValueError("Expecting value"), success])
+
+        result = _doc_call_with_retry(call, "test operation")
+
+        self.assertIs(result, success)
+        self.assertEqual(call.call_count, 2)
+        sleep.assert_called_once()
+
 class SharedPeriodTest(unittest.TestCase):
+    def test_supported_period_spellings_are_normalized(self):
+        cases = {
+            "美宝莲2026 1-6生意情况": "2026年1-6月",
+            "美宝莲2026 1-6月生意情况": "2026年1-6月",
+            "美宝莲20260101-20260328生意情况": "2026-01-01~2026-03-28",
+            "美宝莲2026/1/1 - 2026/3/28生意情况": "2026-01-01~2026-03-28",
+            "美宝莲2026-1-1 - 2026-03-28生意情况": "2026-01-01~2026-03-28",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(normalize_period_hint(text), expected)
+
     def test_tmall_single_month(self):
         parsed = parse_period("5月")
         self.assertEqual(parsed["y2026"], ("2026-05-01", "2026-05-31"))
@@ -177,6 +202,24 @@ class DefaultChainFailureTest(unittest.TestCase):
 
 
 class MediaToolTest(unittest.TestCase):
+    @patch("bot.tools.query_media_investment.fetch_df")
+    def test_media_investment_refuses_range_when_latest_month_is_missing(self, mock_fetch):
+        mock_fetch.return_value = pd.DataFrame([
+            {
+                "year": 2026, "period_month": f"2026-{month:02d}-01",
+                "media": "Tmall", "submedia": "", "ait_roe": "Transaction",
+                "bkfs_overall": "T", "bkfs_xiaohongshu": None,
+                "bkfs_douyin": "T", "spend_million": 1, "row_count": 1,
+            }
+            for month in range(1, 6)
+        ])
+        result = query_media_investment(
+            "KANS", "2026-01-01", "2026-06-30", "2025-01-01", "2025-06-30"
+        )
+        self.assertEqual(result["error"], "requested_period_incomplete")
+        self.assertEqual(result["coverage"]["missing_current_months"], ["2026-06"])
+        self.assertIn("BET花费数据尚未覆盖6月", result["message"])
+
     @patch("bot.tools.query_social_search.fetch_df")
     def test_search_keeps_category_month_separate(self, mock_fetch):
         mock_fetch.return_value = pd.DataFrame([

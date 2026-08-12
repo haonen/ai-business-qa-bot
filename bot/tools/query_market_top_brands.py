@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from bot.db.connection import fetch_df
@@ -13,6 +15,8 @@ from bot.tools.market_common import (
 )
 from bot.utils import parse_ec_period
 
+log = logging.getLogger(__name__)
+
 
 def _rows(df: pd.DataFrame) -> dict[tuple[str, str, str, str], dict]:
     result = {}
@@ -25,7 +29,7 @@ def _rows(df: pd.DataFrame) -> dict[tuple[str, str, str, str], dict]:
 
 
 @tool
-def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: str = "TM", ranking_metric: str = "gmv_growth", limit: int = 5) -> dict:
+def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: str = "TM", ranking_metric: str = "gmv_actual", limit: int = 5) -> dict:
     """查询大盘中可比品牌Top 5；三平台非完整月份不以天猫日表代替。"""
     try:
         parsed = parse_ec_period(period, 2026)
@@ -44,16 +48,42 @@ def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: s
             "AND SELECTIVITY IS NULL" if segment == "PURE MASS"
             else "AND UPPER(TRIM(SELECTIVITY)) = :segment"
         )
-        params = {"segment": segment, "current_start": parsed["current_start"], "current_end": parsed["current_end"],
-                  "prior_start": parsed["prior_start"], "prior_end": parsed["prior_end"],
-                  "current_start_slash": parsed["current_start"].replace("-", "/"), "current_end_slash": parsed["current_end"].replace("-", "/"),
-                  "prior_start_slash": parsed["prior_start"].replace("-", "/"), "prior_end_slash": parsed["prior_end"].replace("-", "/")}
+        def stored_month(value: str) -> str:
+            year, month = str(value)[:7].split("-")
+            return f"{year}-01-{month}"
+
+        params = {
+            "segment": segment,
+            "current_start": parsed["current_start"], "current_end": parsed["current_end"],
+            "prior_start": parsed["prior_start"], "prior_end": parsed["prior_end"],
+            "current_month_start": stored_month(parsed["current_start"]),
+            "current_month_end": stored_month(parsed["current_end"]),
+            "prior_month_start": stored_month(parsed["prior_start"]),
+            "prior_month_end": stored_month(parsed["prior_end"]),
+        }
         monthly_date = monthly_business_date_sql("bus_date")
         monthly = fetch_df(f"""
             SELECT CASE WHEN {monthly_date} BETWEEN :current_start AND :current_end THEN 'current' ELSE 'prior' END period_key,
                    DATE_FORMAT({monthly_date}, '%Y-%m') source_month, UPPER(TRIM(platform)) platform,
                    TRIM(brand_name) brand_name, COUNT(*) row_count, COALESCE(SUM(gmv), 0) gmv
-            FROM three_platform_store_rank_monthly
+            FROM (
+                SELECT bus_date, category_CN, category_EN_level_1,
+                       category_EN_level_2, store_id, store_CN, brand_name,
+                       SELECTIVITY, platform,
+                       MAX(CAST(REPLACE(NULLIF(TRIM(gmv), ''), ',', '') AS DECIMAL(24,4))) AS gmv
+                FROM three_platform_store_rank_monthly
+                WHERE UPPER(TRIM(platform)) IN ({platform_sql})
+                  {monthly_segment_clause}
+                  AND category_EN_level_1 IN ({categories_sql})
+                  AND brand_name IS NOT NULL AND TRIM(brand_name) <> ''
+                  AND (
+                    bus_date BETWEEN :current_month_start AND :current_month_end
+                    OR bus_date BETWEEN :prior_month_start AND :prior_month_end
+                  )
+                GROUP BY bus_date, category_CN, category_EN_level_1,
+                         category_EN_level_2, store_id, store_CN, brand_name,
+                         SELECTIVITY, platform
+            ) monthly_dedup
             WHERE UPPER(TRIM(platform)) IN ({platform_sql})
               {monthly_segment_clause}
               AND category_EN_level_1 IN ({categories_sql}) AND brand_name IS NOT NULL AND TRIM(brand_name) <> ''
@@ -62,8 +92,19 @@ def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: s
                    OR {monthly_date} BETWEEN :prior_start AND :prior_end)
             GROUP BY period_key, source_month, UPPER(TRIM(platform)), TRIM(brand_name)
         """, params)
+        monthly_lookup = _rows(monthly)
+        fallback_slices: list[tuple[str, dict]] = []
+        for period_key, ranges in (("current", slices), ("prior", prior_slices)):
+            for item in ranges:
+                available_platforms = {
+                    key[2] for key in monthly_lookup
+                    if key[0] == period_key and key[1] == item["month"]
+                }
+                if not (item["full_month"] and set(platforms).issubset(available_platforms)):
+                    fallback_slices.append((period_key, item))
+
         daily = pd.DataFrame()
-        if platform == "TM":
+        if platform == "TM" and fallback_slices:
             if segment == "PURE MASS":
                 daily_from = "FROM tmall_store_ranking_day_jiashicang d"
                 daily_segment_clause = "AND d.SELECTIVITY IS NULL"
@@ -89,8 +130,22 @@ def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: s
                     )
                   )
                 """
+            daily_params = dict(params)
+            current_clauses: list[str] = []
+            all_clauses: list[str] = []
+            for index, (period_key, item) in enumerate(fallback_slices):
+                start_key = f"daily_{index}_start"
+                end_key = f"daily_{index}_end"
+                daily_params[start_key] = item["start"].replace("-", "/")
+                daily_params[end_key] = item["end"].replace("-", "/")
+                clause = f"d.bus_date BETWEEN :{start_key} AND :{end_key}"
+                all_clauses.append(clause)
+                if period_key == "current":
+                    current_clauses.append(clause)
+            current_case = " OR ".join(current_clauses) or "FALSE"
+            fallback_where = " OR ".join(all_clauses)
             daily = fetch_df(f"""
-                SELECT CASE WHEN d.bus_date BETWEEN :current_start_slash AND :current_end_slash THEN 'current' ELSE 'prior' END period_key,
+                SELECT CASE WHEN ({current_case}) THEN 'current' ELSE 'prior' END period_key,
                        DATE_FORMAT(STR_TO_DATE(d.bus_date, '%Y/%m/%d'), '%Y-%m') source_month, 'TM' platform,
                        TRIM(d.brand_name) brand_name, COUNT(*) row_count,
                        COALESCE(SUM(CAST(REPLACE(NULLIF(TRIM(d.gmv), ''), ',', '') AS DECIMAL(24,4))), 0) gmv
@@ -99,10 +154,10 @@ def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: s
                   {daily_segment_clause}
                   AND d.brand_name IS NOT NULL AND TRIM(d.brand_name) <> ''
                   AND CAST(REPLACE(NULLIF(TRIM(d.gmv), ''), ',', '') AS DECIMAL(24,4)) >= 0
-                  AND (d.bus_date BETWEEN :current_start_slash AND :current_end_slash OR d.bus_date BETWEEN :prior_start_slash AND :prior_end_slash)
+                  AND ({fallback_where})
                 GROUP BY period_key, source_month, TRIM(d.brand_name)
-            """, params)
-        monthly_lookup, daily_lookup = _rows(monthly), _rows(daily)
+            """, daily_params)
+        daily_lookup = _rows(daily)
         chosen: list[dict] = []
         missing: list[dict] = []
         for period_key, ranges in (("current", slices), ("prior", prior_slices)):
@@ -142,18 +197,31 @@ def query_market_top_brands(period: str, segment: str = "PURE MASS", platform: s
             prior = totals["prior"].get(brand)
             if prior is None or prior <= 0:
                 new_brands.append({"brand": brand, "gmv_actual": current})
+                if ranking_metric == "gmv_actual":
+                    comparable.append({"brand": brand, "gmv_actual": current, "gmv_prior": None,
+                                       "evol": None, "gmv_growth": None})
                 continue
             growth = current - prior
             comparable.append({"brand": brand, "gmv_actual": current, "gmv_prior": prior,
                                "evol": current / prior - 1, "gmv_growth": growth})
-        metric = "evol" if ranking_metric == "evol" else "gmv_growth"
-        comparable = [row for row in comparable if row[metric] > 0]
-        comparable.sort(key=lambda row: row[metric], reverse=True)
+        metric = ranking_metric if ranking_metric in {"gmv_actual", "gmv_growth", "evol"} else "gmv_actual"
+        candidate_pool = list(comparable)
+        if metric != "gmv_actual":
+            comparable = [row for row in comparable if row.get(metric) is not None and row[metric] > 0]
+        comparable.sort(key=lambda row: float(row.get(metric) or 0), reverse=True)
         result_rows = [{"rank": rank, **row} for rank, row in enumerate(comparable[:max(1, min(int(limit), 20))], 1)]
         return {"query_meta": {"tool": "query_market_top_brands", "segment": segment, "category": "Total Beauty", "platform": platform,
                                "ranking_metric": metric, "current_period": [parsed["current_start"], parsed["current_end"]],
                                "prior_period": [parsed["prior_start"], parsed["prior_end"]]},
-                "rows": result_rows, "coverage": chosen, "missing": [], "new_brands": sorted(new_brands, key=lambda x: x["gmv_actual"], reverse=True)[:5],
-                "evidence": [{"rank": row["rank"], "brand": row["brand"], "value": row[metric]} for row in result_rows]}
-    except Exception as exc:
-        return {"error": "execution_error", "message": str(exc)}
+                "rows": result_rows, "candidate_pool": candidate_pool, "coverage": chosen, "missing": [], "new_brands": sorted(new_brands, key=lambda x: x["gmv_actual"], reverse=True)[:5],
+                "evidence": [{"rank": row["rank"], "brand": row["brand"], "value": row.get(metric)} for row in result_rows],
+                "deduplication": "monthly rows collapsed by month/platform/store/brand/category business key before aggregation"}
+    except Exception:
+        log.exception(
+            "[market_top_brands] query failed period=%s segment=%s platform=%s metric=%s",
+            period, segment, platform, ranking_metric,
+        )
+        return {
+            "error": "execution_error",
+            "message": "品牌榜数据查询超时或连接中断，请稍后重试。系统未生成可能失真的排名。",
+        }

@@ -167,6 +167,15 @@ class FollowupPlannerTest(unittest.TestCase):
                 self.assertEqual(plan.domain, "bet")
                 self.assertEqual(plan.metrics, ["fee_ratio", "fee_ratio_change"])
 
+    def test_bare_bet_and_ait_mean_media_spend_in_followups(self):
+        for wording in ("KANS 2026年3月的BET是多少", "KANS 2026年3月的AIT是多少"):
+            with self.subTest(wording=wording):
+                plan = build_followup_plan(
+                    wording, SessionState(), brand="KANS", period="2026年3月"
+                )
+                self.assertEqual(plan.domain, "bet")
+                self.assertEqual(plan.metrics, ["spend_actual", "spend_evol"])
+
     @patch("bot.followup_plan._llm_plan")
     def test_explicit_spend_is_restored_when_llm_omits_it(self, llm_plan):
         llm_plan.return_value = {
@@ -300,6 +309,25 @@ class FollowupToolTest(unittest.TestCase):
         self.assertEqual(result["rows"][0]["fee_ratio"], 0.5)
         self.assertEqual(result["rows"][0]["fee_ratio_change"], 0.0)
 
+    @patch("bot.tools.query_bet_followup_table.fetch_df")
+    def test_bet_followup_refuses_incomplete_requested_period(self, fetch):
+        fetch.return_value = pd.DataFrame([
+            {
+                "period_key": "current", "period_month": f"2026-{month:02d}-01",
+                "ait": "Transaction", "media": "JD", "submedia": "",
+                "bkfs_overall": "T", "bkfs_xiaohongshu": None,
+                "bkfs_douyin": None, "spend": 100, "row_count": 1,
+            }
+            for month in range(1, 6)
+        ])
+        result = query_bet_followup_table(
+            "KANS", "2026年1-6月", [], {}, ["spend_actual"],
+            source_brands={"topline": "KANS"},
+        )
+        self.assertEqual(result["error"], "requested_period_incomplete")
+        self.assertIn("6月", result["message"])
+        self.assertIn("不返回", result["message"])
+
     @patch("bot.tools.query_change_contribution.query_ec_followup_table")
     def test_change_contribution_separates_growth_and_drag(self, query):
         query.return_value = {"rows": [
@@ -322,7 +350,7 @@ class FollowupFormatterTest(unittest.TestCase):
         result = {"rows": [{"month": "2026-01", "spend_actual": 1000000,
                             "spend_evol": .1, "fee_ratio": .2, "fee_ratio_change": .01}], "evidence": []}
         rendered = format_followup_result(plan, result)
-        self.assertIn("媒体花费 Actual", rendered["markdown"])
+        self.assertIn("BET花费 Actual", rendered["markdown"])
         self.assertIn("媒体费比", rendered["markdown"])
 
     def test_data_organizer_stays_table_only_and_inline(self):

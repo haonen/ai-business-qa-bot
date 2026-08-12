@@ -76,6 +76,9 @@ def _build(start: date, end: date) -> MediaPeriod:
 
 def normalize_media_period_hint(text: str) -> str | None:
     text = (text or "").strip()
+    shared = normalize_period_hint(text)
+    if shared:
+        return shared
     full_dates = re.search(
         rf"20\d{{2}}-\d{{2}}-\d{{2}}{_RANGE_SEP}20\d{{2}}-\d{{2}}-\d{{2}}",
         text,

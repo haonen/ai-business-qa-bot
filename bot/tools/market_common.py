@@ -5,8 +5,13 @@ from datetime import date
 
 
 MARKET_PLATFORMS = ("TM", "DY", "JD")
-MARKET_SEGMENTS = ("PURE MASS", "SELECTIVE", "PROFESSIONAL")
+MARKET_SEGMENTS = ("BEAUTY MARKET", "PURE MASS", "SELECTIVE", "PROFESSIONAL")
 TTL_CATEGORIES = ("Skincare", "Hair", "Makeup + Fragrance", "Makeup+Fragrance")
+
+
+def date_cast_sql(column: str = "bus_date") -> str:
+    """Normalize a DATE or YYYY-MM-DD string column before date operations."""
+    return f"CAST({column} AS DATE)"
 
 
 def monthly_business_date_sql(column: str = "bus_date") -> str:

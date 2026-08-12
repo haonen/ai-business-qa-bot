@@ -32,10 +32,10 @@ def _raw_rows(context: dict, filters: dict) -> pd.DataFrame:
     sql = """
         SELECT
           CASE
-            WHEN bus_date BETWEEN :current_start AND :current_end THEN 'current'
+            WHEN CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end THEN 'current'
             ELSE 'prior'
           END AS period_key,
-          DATE_FORMAT(bus_date, '%Y-%m') AS source_month,
+          DATE_FORMAT(CAST(bus_date AS DATE), '%Y-%m') AS source_month,
           category_CN AS category,
           key_driver,
           item_id AS sku,
@@ -46,8 +46,8 @@ def _raw_rows(context: dict, filters: dict) -> pd.DataFrame:
         FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
         WHERE brand_name = :brand
           AND (
-            bus_date BETWEEN :current_start AND :current_end
-            OR bus_date BETWEEN :prior_start AND :prior_end
+            CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
+            OR CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
           )
           AND (:category IS NULL OR category_CN = :category)
           AND (:key_driver IS NULL OR key_driver = :key_driver)

@@ -13,12 +13,15 @@ from bot.tools.query_series import query_series
 from bot.tools.query_sku_list import query_sku_list
 from bot.tools.query_tmall_gmv import query_tmall_gmv
 from bot.tools.query_douyin_gmv import query_douyin_gmv
+from bot.tools.query_douyin_business import query_douyin_business
+from bot.tools.query_jd_business import query_jd_business
 from bot.tools.query_ec_followup_table import query_ec_followup_table
 from bot.tools.query_bet_followup_table import query_bet_followup_table
 from bot.tools.query_change_contribution import query_change_contribution
 from bot.tools.query_ec_bet_monthly import query_ec_bet_monthly
 from bot.tools.query_market_trend import query_market_trend
 from bot.tools.query_market_top_brands import query_market_top_brands
+from bot.tools.query_market_brand_deep_dive import query_market_brand_deep_dive
 
 
 TOOL_REGISTRY = {
@@ -34,6 +37,8 @@ TOOL_REGISTRY = {
     "query_media_investment": query_media_investment,
     "query_tmall_gmv": query_tmall_gmv,
     "query_douyin_gmv": query_douyin_gmv,
+    "query_douyin_business": query_douyin_business,
+    "query_jd_business": query_jd_business,
     "query_kol_performance": query_kol_performance,
     "query_ec_followup_table": query_ec_followup_table,
     "query_bet_followup_table": query_bet_followup_table,
@@ -41,6 +46,7 @@ TOOL_REGISTRY = {
     "query_ec_bet_monthly": query_ec_bet_monthly,
     "query_market_trend": query_market_trend,
     "query_market_top_brands": query_market_top_brands,
+    "query_market_brand_deep_dive": query_market_brand_deep_dive,
 }
 
 

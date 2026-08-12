@@ -22,7 +22,7 @@ def query_social_search(brand: str, start_month: str, end_month: str) -> dict:
         df = fetch_df(
             """
             SELECT
-                report_month,
+                CAST(report_month AS DATE) AS report_month,
                 grain_level,
                 brand,
                 category,
@@ -31,8 +31,8 @@ def query_social_search(brand: str, start_month: str, end_month: str) -> dict:
                 calculated_yoy_rate
             FROM ai_bot_media_search_index
             WHERE brand = :brand
-              AND report_month BETWEEN :start_month AND :end_month
-            ORDER BY report_month, grain_level, current_search_index DESC
+              AND CAST(report_month AS DATE) BETWEEN :start_month AND :end_month
+            ORDER BY CAST(report_month AS DATE), grain_level, current_search_index DESC
             """,
             {"brand": brand, "start_month": start_month, "end_month": end_month},
         )

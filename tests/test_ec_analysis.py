@@ -73,7 +73,7 @@ class EcContextTest(unittest.TestCase):
         current_sql = fetch_one.call_args_list[1].args[0]
         prior_sql = fetch_one.call_args_list[2].args[0]
         self.assertIn("FORCE INDEX (idx_tmall_brand_date)", latest_sql)
-        self.assertIn("ORDER BY bus_date DESC", latest_sql)
+        self.assertIn("ORDER BY CAST(bus_date AS DATE) DESC", latest_sql)
         self.assertIn("LIMIT 1", current_sql)
         self.assertIn("LIMIT 1", prior_sql)
 
@@ -278,6 +278,50 @@ class TmallBrandIndexPipelineTest(unittest.TestCase):
 
 
 class EcRouteTest(unittest.TestCase):
+    @patch("bot.router.classify_user_intent", return_value=None)
+    def test_business_and_investment_without_platform_asks_platform(self, _classify):
+        result = route(
+            "分析一下dirovo2026年4-6月的表现，重点看主推商品的生意表现和投资情况。",
+            SessionState(),
+        )
+        self.assertEqual(result.type, "clarify_analysis_scope")
+        self.assertEqual(result.preflight_target, "brand_business_investment_analysis")
+        self.assertEqual(result.brand, "dirovo")
+        self.assertEqual(result.period, "2026年4-6月")
+
+    def test_composite_analysis_requires_scope_confirmation_before_queries(self):
+        first = route(
+            "分析一下dirovo2026年4-6月的表现，重点看主推商品的生意表现和投资情况。",
+            SessionState(),
+        )
+        self.assertEqual(first.type, "clarify_analysis_scope")
+        for phrase in ("可以回答", "不能直接回答", "逐笔归因", "天猫，确认"):
+            self.assertIn(phrase, first.message)
+
+        state = SessionState(pending_request={
+            "intent": "analysis_preflight",
+            "target": first.preflight_target,
+            "brand": first.brand,
+            "period": first.period,
+            "brand_aliases": first.brand_aliases,
+            "platform": first.platform,
+        })
+        resumed = route("天猫，确认", state)
+        self.assertEqual(resumed.type, "brand_business_investment_analysis")
+        self.assertEqual(resumed.platform, "TM")
+
+    def test_platform_reply_resumes_joint_business_and_bet_request(self):
+        state = SessionState(pending_request={
+            "intent": "brand_business_investment_analysis",
+            "brand": "dirovo",
+            "period": "2026年4-6月",
+            "brand_aliases": ["dirovo"],
+        })
+        result = route("天猫", state)
+        self.assertEqual(result.type, "brand_business_investment_analysis")
+        self.assertEqual(result.platform, "TM")
+        self.assertEqual(result.period, "2026年4-6月")
+
     @patch("bot.router.classify_user_intent")
     def test_default_analysis_without_period_clarifies(self, classify):
         classify.return_value = IntentResult(
@@ -383,6 +427,12 @@ class EcDefaultChainBrandTest(unittest.TestCase):
 
 
 class EcipTmallGmvTest(unittest.TestCase):
+    def test_monthly_table_storage_restores_business_month(self):
+        from bot.tools.market_common import monthly_business_date_sql
+        expression = monthly_business_date_sql("bus_date")
+        self.assertIn("LPAD(DAY(bus_date)", expression)
+        self.assertIn("STR_TO_DATE", expression)
+
     @patch("bot.tools.query_ecip_tmall_gmv.fetch_df")
     @patch("bot.tools.query_ecip_tmall_gmv.ec_query_context")
     def test_ttl_gmv_uses_ecip_mass_and_three_business_categories(
@@ -419,7 +469,7 @@ class EcipTmallGmvTest(unittest.TestCase):
         daily_sql = fetch_df.call_args_list[1].args[0]
         params = fetch_df.call_args_list[1].args[1]
         self.assertIn("three_platform_store_rank_monthly", monthly_sql)
-        self.assertIn("LPAD(DAY(bus_date), 2, '0')", monthly_sql)
+        self.assertIn("LPAD(DAY(bus_date)", monthly_sql)
         self.assertIn("UPPER(TRIM(platform)) IN ('TM', 'TMALL')", monthly_sql)
         self.assertIn("tmall_store_ranking_day_jiashicang", daily_sql)
         for sql in (monthly_sql, daily_sql):
@@ -428,8 +478,9 @@ class EcipTmallGmvTest(unittest.TestCase):
             self.assertIn("'Hair'", sql)
             self.assertIn("'Makeup + Fragrance'", sql)
             self.assertNotIn("'Fragrance'", sql)
-        self.assertEqual(params["current_start_slash"], "2026/07/01")
-        self.assertEqual(params["prior_start_slash"], "2025/07/01")
+        self.assertEqual(params["current_start_iso"], "2026-07-01")
+        self.assertEqual(params["prior_start_iso"], "2025-07-01")
+        self.assertNotIn("current_start_slash", params)
         self.assertEqual(result["coverage"]["daily_used"], ["2025-07", "2026-07"])
         self.assertEqual(result["coverage"]["monthly_used"], [])
 

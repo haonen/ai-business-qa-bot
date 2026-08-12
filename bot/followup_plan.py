@@ -77,7 +77,11 @@ def _mentions_fee_ratio(text: str) -> bool:
 
 def _mentions_media_spend(text: str) -> bool:
     lowered = str(text or "").casefold()
-    return any(token in lowered for token in ("媒体花费", "媒体投资", "媒体费用", "media spend", "spend"))
+    return (
+        any(token in lowered for token in ("媒体花费", "媒体投资", "媒体费用", "media spend", "spend"))
+        # 在数字追问里，单独的 BET/AIT 指媒体花费；BET% 仍是媒体费比。
+        or bool(re.search(r"(?<![a-z0-9])(?:bet|ait)(?![a-z0-9%])", lowered))
+    )
 
 
 def _enforce_explicit_metrics(plan: FollowupPlan, text: str) -> FollowupPlan:
@@ -134,7 +138,11 @@ def _skill_guidance() -> str:
 
 def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | None) -> dict:
     lowered = text.casefold()
-    has_bet = any(token in lowered for token in BET_HINTS) or _mentions_fee_ratio(text)
+    has_bet = (
+        any(token in lowered for token in BET_HINTS)
+        or _mentions_fee_ratio(text)
+        or _mentions_media_spend(text)
+    )
     has_ec = any(token in lowered for token in EC_HINTS)
     domain = "ec_bet" if (has_bet and has_ec) or ("搜索" in text and "生意" in text) else ("bet" if has_bet else "ec")
     ctx = state.bet_context if domain == "bet" else state.ec_context
@@ -245,7 +253,7 @@ skill只能analysis_drill或data_organizer；domain只能ec/bet/ec_bet。
 group_by只能month/category/key_driver/series/sku/ait/platform/bkfst/kol_platform/tier/kol_type/kol。
 filters只能category/key_driver/series/function_tag/platform/ait/bkfst/tier/kol_type。
 metrics只能gmv_actual/gmv_evol/unit_actual/unit_evol/atv_actual/spend_actual/spend_evol/spend_weight/spend_weight_change/nso_actual/nso_evol/fee_ratio/fee_ratio_change/search_actual/search_evol/cost_actual/cost_evol/cost_weight/cost_weight_change/engage_actual/engage_evol/cpe。
-媒体费比、Take Rate、TR和BET%是同一个KPI，统一使用fee_ratio/fee_ratio_change。用户同时点名媒体花费和费比时，metrics必须同时包含spend_actual、spend_evol、fee_ratio、fee_ratio_change，不得省略任何一个。
+媒体费比、Take Rate、TR和BET%是同一个KPI，统一使用fee_ratio/fee_ratio_change。数字追问中单独的BET或AIT都指媒体花费，必须使用spend_actual/spend_evol，不得解释为其他指标。用户同时点名媒体花费和费比时，metrics必须同时包含spend_actual、spend_evol、fee_ratio、fee_ratio_change，不得省略任何一个。
 不要补造品牌或时间；缺失就空字符串。用户说按月/整理/列出/表格/趋势/排名/对比时优先data_organizer，EC与BET同月对照用analysis_drill+ec_bet+trend_alignment。
 """
     try:

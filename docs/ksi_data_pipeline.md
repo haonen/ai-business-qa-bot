@@ -295,7 +295,7 @@ SELECT
     SUM(ttl_engagement) AS ttl_engagement,
     SUM(big_v_cost) / NULLIF(SUM(ttl_engagement), 0) AS cpe
 FROM ai_bot_media_ksi_performance
-WHERE period_month BETWEEN '2026-01-01' AND '2026-05-01'
+WHERE CAST(period_month AS DATE) BETWEEN '2026-01-01' AND '2026-05-01'
   AND COALESCE(kol_id_front, kol_id_back, nickname) IS NOT NULL
 GROUP BY
     platform,

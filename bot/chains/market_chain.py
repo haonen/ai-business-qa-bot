@@ -7,6 +7,7 @@ from bot.market_formatter import format_market_result
 from bot.market_plan import MarketPlan
 from bot.skills.loader import load_skill
 from bot.tools.query_market_top_brands import query_market_top_brands
+from bot.tools.query_market_brand_deep_dive import query_market_brand_deep_dive
 from bot.tools.query_market_trend import query_market_trend
 
 
@@ -19,8 +20,16 @@ def run_market_chain(plan: MarketPlan) -> dict:
     load_skill("market_analysis")  # Keep the executable chain tied to its business contract.
     if not plan.period:
         return {"ok": False, "markdown": "你想看哪个时间段的大盘？", "meta": {"document_ready": False, "awaiting": "period"}}
-    if plan.intent == "market_brand_ranking":
-        raw = query_market_top_brands(plan.period, plan.segment, plan.platform, plan.ranking_metric, 5)
+    if plan.intent == "market_brand_deep_dive":
+        raw = query_market_brand_deep_dive(
+            plan.period, plan.segment, min(plan.ranking_limit, 3),
+            plan.platform, plan.ranking_metric,
+        )
+    elif plan.intent == "market_brand_ranking":
+        raw = query_market_top_brands(
+            plan.period, plan.segment, plan.platform,
+            plan.ranking_metric, plan.ranking_limit,
+        )
     else:
         raw = query_market_trend(plan.period, plan.segment, plan.platform, plan.view)
     coverage_sources = sorted({
