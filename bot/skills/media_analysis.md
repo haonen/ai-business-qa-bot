@@ -9,7 +9,7 @@ description: 生成品牌BET媒体投资飞书报告。用于媒体投资、BET�
 
 ## 固定流程
 
-1. 解析2026年分析月份，并生成去年同期。
+1. 解析2026年分析月份，并生成去年同期。`YTD`/“年初至今”从1月累计到当前月；`MTD`/“本月至今”按当前月处理，并由数据覆盖校验裁剪到最新可用月份。
 2. 在Search、Topline、KSI和EC Consolidation NSO数据源中分别解析品牌。
 3. 调用结构化查询Tool，不生成或执行任意SQL。
 4. 固定依次输出Media Investment、KOL Performance、Social Search三个部分。

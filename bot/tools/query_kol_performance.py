@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from bot.db.connection import fetch_df
+from bot.platforms import canonical_platform, platform_filter_sql
 from bot.tools.common import tool
 from bot.utils import clean_label, safe_div, safe_evol
 
@@ -106,14 +107,19 @@ def query_kol_performance(
 ) -> dict:
     """查询RED或Douyin的Tier、KOL Type汇总及按Engage排序的Top KOL。"""
     try:
-        platform = str(platform or "").strip().lower()
-        if platform not in {"red", "douyin"}:
+        try:
+            canonical = canonical_platform(platform, allow_ttl=False, allow_red=True)
+        except ValueError:
             return {"error": "invalid_platform", "message": "platform只支持red或douyin。"}
+        if canonical not in {"RED", "DY"}:
+            return {"error": "invalid_platform", "message": "platform只支持red或douyin。"}
+        platform = "red" if canonical == "RED" else "douyin"
+        platform_clause = platform_filter_sql("ai_bot_media_ksi_performance", canonical)
         if not 1 <= int(top_n) <= 50:
             return {"error": "invalid_top_n", "message": "top_n必须在1到50之间。"}
 
         summary = fetch_df(
-            """
+            f"""
             SELECT
                 year,
                 CAST(period_month AS DATE) AS period_month,
@@ -124,7 +130,7 @@ def query_kol_performance(
                 COUNT(*) AS row_count
             FROM ai_bot_media_ksi_performance
             WHERE brand = :brand
-              AND LOWER(platform) = :platform
+              AND {platform_clause}
               AND (
                 CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end
                 OR CAST(period_month AS DATE) BETWEEN :prior_start AND :prior_end
@@ -199,7 +205,7 @@ def query_kol_performance(
             engage_status = "base_zero" if prior_engage == 0 else "ok"
 
         top = fetch_df(
-            """
+            f"""
             SELECT
                 COALESCE(
                     MAX(NULLIF(TRIM(nickname), '')),
@@ -212,7 +218,7 @@ def query_kol_performance(
                 SUM(COALESCE(ttl_engagement, 0)) AS engage
             FROM ai_bot_media_ksi_performance
             WHERE brand = :brand
-              AND LOWER(platform) = :platform
+              AND {platform_clause}
               AND CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end
             GROUP BY COALESCE(
                 NULLIF(TRIM(kol_id_front), ''),

@@ -6,6 +6,7 @@ import pandas as pd
 
 from bot.db.connection import fetch_df, fetch_one
 from bot.media_brand import normalize_brand, resolve_source_brand
+from bot.platforms import platform_filter_sql
 from bot.tools.common import tool
 from bot.tools.market_common import month_slices
 from bot.utils import parse_ec_period, safe_div, safe_evol
@@ -76,7 +77,7 @@ def _resolve_jd_brand(
         SELECT DISTINCT TRIM(brand_name) AS source_brand
         FROM {MONTHLY_TABLE}
         WHERE brand_name IN ({placeholders})
-          AND UPPER(TRIM(platform)) = 'JD'
+          AND {platform_filter_sql(MONTHLY_TABLE, 'JD')}
         """,
         params,
     )
@@ -113,7 +114,9 @@ def _fetch_category_slice(
     end: str,
     monthly: bool,
 ) -> pd.DataFrame:
-    platform_clause = "AND UPPER(TRIM(platform)) = 'JD'" if monthly else ""
+    platform_clause = (
+        "AND " + platform_filter_sql(MONTHLY_TABLE, "JD") if monthly else ""
+    )
     return fetch_df(
         f"""
         SELECT
@@ -140,40 +143,56 @@ def _query_category_frames(
     brand: str,
     period_meta: dict,
 ) -> tuple[pd.DataFrame, list[dict], list[dict]]:
-    frames: list[pd.DataFrame] = []
-    sources: list[dict] = []
-    missing: list[dict] = []
+    business_date = "CAST(bus_date AS DATE)"
+    frame = fetch_df(
+        f"""
+        SELECT
+          CASE
+            WHEN {business_date} BETWEEN :current_start AND :current_end THEN 'current'
+            ELSE 'prior'
+          END AS period_key,
+          DATE_FORMAT({business_date}, '%Y-%m') AS source_month,
+          COALESCE(NULLIF(TRIM(category_level_3), ''), '未分类') AS category_level_3,
+          SUM({_amount_sql('gmv')}) AS gmv,
+          COUNT(*) AS row_count
+        FROM {JD_DAILY_TABLE}
+        WHERE TRIM(brand_name) = :brand
+          AND (
+            {business_date} BETWEEN :current_start AND :current_end
+            OR {business_date} BETWEEN :prior_start AND :prior_end
+          )
+        GROUP BY period_key, source_month,
+                 COALESCE(NULLIF(TRIM(category_level_3), ''), '未分类')
+        """,
+        {
+            "brand": brand,
+            **{key: period_meta[key] for key in (
+                "current_start", "current_end", "prior_start", "prior_end",
+            )},
+        },
+    )
+    sources = []
+    missing = []
+    present = set()
+    if not frame.empty:
+        present = {
+            (str(row["period_key"]), str(row["source_month"]))
+            for _, row in frame[["period_key", "source_month"]].drop_duplicates().iterrows()
+        }
     for period_key, start_key, end_key in (
         ("current", "current_start", "current_end"),
         ("prior", "prior_start", "prior_end"),
     ):
         for item in _source_slices(period_meta[start_key], period_meta[end_key]):
-            frame = _fetch_category_slice(
-                table=item["table"],
-                brand=brand,
-                period_key=period_key,
-                start=item["start"],
-                end=item["end"],
-                monthly=item["source"] == "monthly",
-            )
-            selected_source = item["source"]
-            selected_table = item["table"]
             source_row = {
-                "period": period_key,
-                "month": item["month"],
-                "source": selected_source,
-                "table": selected_table,
-                "start": item["start"],
-                "end": item["end"],
+                "period": period_key, "month": item["month"],
+                "source": "daily", "table": JD_DAILY_TABLE,
+                "start": item["start"], "end": item["end"],
             }
             sources.append(source_row)
-            if frame.empty:
+            if (period_key, item["month"]) not in present:
                 missing.append(source_row)
-            else:
-                frames.append(frame)
-    if not frames:
-        return pd.DataFrame(), sources, missing
-    return pd.concat(frames, ignore_index=True), sources, missing
+    return frame, sources, missing
 
 
 def _paired_category_rows(frame: pd.DataFrame) -> tuple[dict, list[dict]]:
@@ -268,7 +287,8 @@ def query_jd_business(
         ).get("max_date")
         monthly_max = fetch_one(
             f"SELECT MAX(CAST(bus_date AS DATE)) AS max_date FROM {MONTHLY_TABLE} "
-            "WHERE TRIM(brand_name) = :brand AND UPPER(TRIM(platform)) = 'JD'",
+            "WHERE TRIM(brand_name) = :brand AND "
+            + platform_filter_sql(MONTHLY_TABLE, "JD"),
             {"brand": source_brand},
         ).get("max_date")
         latest_values = [str(value)[:10] for value in (daily_max, monthly_max) if value]

@@ -9,16 +9,15 @@ import fcntl
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
-    CreateMessageRequest,
-    CreateMessageRequestBody,
     P2ImMessageReceiveV1,
-    UpdateMessageRequest,
-    UpdateMessageRequestBody,
 )
 
-from bot.app import run_agent
 from bot.config import get_env, validate_runtime_env
-from bot.session import add_message, get_session
+from bot.messaging import send_reply, send_text, update_text
+from bot.request_processor import process_request
+from bot.runtime_config import queue_enabled, worker_settings
+from bot.request_audit import record_outcome, record_received
+from bot.agent_plan import initial_status
 
 
 validate_runtime_env()
@@ -65,133 +64,117 @@ def _claim_recent_key(namespace: str, key_src: str, ttl_seconds: int) -> bool:
         return True
 
 
-def _send_reply(chat_id: str, text: str):
-    card = {"schema": "2.0", "body": {"elements": [{"tag": "markdown", "content": text}]}}
-    resp = cli.im.v1.message.create(
-        CreateMessageRequest.builder()
-        .receive_id_type("chat_id")
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("interactive")
-            .content(json.dumps(card, ensure_ascii=False))
-            .build()
-        )
-        .build()
-    )
-    if not resp.success():
-        lark.logger.error(f"send_reply failed: {resp.code} {resp.msg}")
-
-
-def _send_text(chat_id: str, text: str) -> str | None:
-    resp = cli.im.v1.message.create(
-        CreateMessageRequest.builder()
-        .receive_id_type("chat_id")
-        .request_body(
-            CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
-            .msg_type("text")
-            .content(json.dumps({"text": text}, ensure_ascii=False))
-            .build()
-        )
-        .build()
-    )
-    return resp.data.message_id if resp.success() else None
-
-
-def _update_text(message_id: str | None, text: str):
-    if not message_id:
-        return
-    cli.im.v1.message.update(
-        UpdateMessageRequest.builder()
-        .message_id(message_id)
-        .request_body(
-            UpdateMessageRequestBody.builder()
-            .msg_type("text")
-            .content(json.dumps({"text": text}, ensure_ascii=False))
-            .build()
-        )
-        .build()
-    )
-
-
 def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
     message = data.event.message
     if message.chat_type != "p2p":
         return
-    if message.message_id in _processed or not _claim_recent_key("message_id", message.message_id, 86400):
-        return
-    _processed.add(message.message_id)
+    if queue_enabled():
+        try:
+            from bot.task_queue import claim_recent_key
+
+            if not claim_recent_key("message_id", message.message_id, 86400):
+                return
+        except Exception as exc:
+            lark.logger.exception(f"Redis dedupe unavailable: {exc}")
+            send_reply(cli, message.chat_id, "任务队列暂时不可用，请稍后重新发送。")
+            return
+    else:
+        if message.message_id in _processed or not _claim_recent_key("message_id", message.message_id, 86400):
+            return
+        _processed.add(message.message_id)
     if message.message_type != "text":
-        _send_reply(message.chat_id, "抱歉，目前只支持文字消息。")
+        send_reply(cli, message.chat_id, "抱歉，目前只支持文字消息。")
         return
     open_id = data.event.sender.sender_id.open_id
     user_text = json.loads(message.content).get("text", "").strip()
-    if not user_text or not _claim_recent_key("request_text", f"{open_id}\n{user_text}", 180):
+    if not user_text:
+        return
+    record_received(
+        message_id=message.message_id,
+        chat_id=message.chat_id,
+        open_id=open_id,
+        user_text=user_text,
+        create_time=message.create_time,
+    )
+
+    if queue_enabled():
+        from bot.task_queue import (
+            claim_recent_key,
+            enqueue_request,
+            job_id_for_message,
+            release_recent_key,
+        )
+
+        text_key = f"{open_id}\n{user_text}"
+        placeholder_id = None
+        try:
+            if not claim_recent_key("request_text", text_key, 180):
+                send_reply(cli, message.chat_id, "相同请求已经提交，正在处理中，请稍候。")
+                return
+            job_id = job_id_for_message(message.message_id)
+            placeholder_id = send_text(
+                cli,
+                message.chat_id,
+                initial_status(queued=True, job_id=job_id),
+            )
+            payload = {
+                "job_id": job_id,
+                "message_id": message.message_id,
+                "chat_id": message.chat_id,
+                "open_id": open_id,
+                "user_text": user_text,
+                "placeholder_id": placeholder_id,
+            }
+            enqueue_request(payload)
+        except Exception as exc:
+            try:
+                release_recent_key("request_text", text_key)
+            except Exception:
+                pass
+            lark.logger.exception(f"enqueue failed: {exc}")
+            record_outcome(
+                message_id=message.message_id,
+                result=None,
+                elapsed_ms=0,
+                status="failed",
+                error_message=f"enqueue failed: {exc}",
+            )
+            if placeholder_id:
+                update_text(cli, placeholder_id, "任务队列暂时不可用，请稍后重新发送。")
+            else:
+                send_reply(cli, message.chat_id, "任务队列暂时不可用，请稍后重新发送。")
         return
 
-    placeholder_id = _send_text(message.chat_id, "正在分析数据，请稍候…")
-
-    def on_progress(stage_text: str):
-        _update_text(placeholder_id, stage_text)
+    placeholder_id = send_text(cli, message.chat_id, initial_status(queued=False))
 
     try:
-        state = get_session(open_id)
-        result = run_agent(open_id, user_text, state, on_progress=on_progress)
-        markdown = result.get("markdown") or "没有生成可用结果。"
-        add_message(open_id, "user", user_text)
-        add_message(open_id, "assistant", markdown)
-
-        route_type = result.get("route_type")
-        report_meta = result.get("meta", {})
-        market_document = route_type in {"market_analysis", "market_brand_ranking", "market_brand_deep_dive"}
-        brand_document = route_type in {
-            "default_chain", "brand_business_investment_analysis", "douyin_business_analysis", "jd_business_analysis", "media_analysis", "skill_dispatch"
-        } and report_meta.get("brand")
-        if (market_document or brand_document) and report_meta.get("document_ready", True):
-            import bot.feishu_doc as feishu_doc
-
-            brand = result["meta"].get("brand")
-            period = result["meta"].get("period")
-            if market_document:
-                doc_title = result["meta"].get("document_title") or f"{period} 大盘分析"
-            elif route_type == "skill_dispatch":
-                doc_title = result["meta"].get("document_title") or f"{brand} {period} 数据分析"
-            elif route_type == "brand_business_investment_analysis":
-                doc_title = result["meta"].get("document_title") or f"{brand} {period} 生意与BET投资联合分析"
-            elif route_type == "media_analysis":
-                period_title = result["meta"].get("period_display") or period
-                doc_title = f"{brand} {period_title} BET媒体投资分析报告"
-            elif route_type == "douyin_business_analysis":
-                doc_title = f"{brand} {period} 抖音生意分析报告"
-            elif route_type == "jd_business_analysis":
-                doc_title = f"{brand} {period} 京东品牌生意分析"
-            else:
-                doc_title = f"{brand} {period} 生意分析报告"
-            on_progress("正在生成分析报告文档…")
-            try:
-                doc_url = feishu_doc.create_feishu_doc(cli, doc_title, markdown)
-                _update_text(placeholder_id, f"已生成「{doc_title}」分析报告：{doc_url}")
-            except Exception as doc_exc:
-                lark.logger.exception(f"document generation failed: {doc_exc}")
-                _update_text(
-                    placeholder_id,
-                    "数据分析已完成，但飞书文档服务暂时限流。已将结果直接发送到当前会话，请稍后重试生成文档。",
-                )
-                try:
-                    _send_reply(message.chat_id, markdown)
-                except Exception as reply_exc:
-                    lark.logger.exception(f"analysis fallback reply failed: {reply_exc}")
-        else:
-            _update_text(placeholder_id, "已完成，结果如下：")
-            _send_reply(message.chat_id, markdown)
+        process_request(
+            cli,
+            open_id=open_id,
+            chat_id=message.chat_id,
+            user_text=user_text,
+            placeholder_id=placeholder_id,
+            message_id=message.message_id,
+        )
     except Exception as exc:
         lark.logger.exception(f"agent failed: {exc}")
-        _update_text(placeholder_id, f"分析时遇到问题：{exc}，请重新尝试或换个问题。")
+        update_text(cli, placeholder_id, f"处理时遇到问题：{exc}，请重新尝试或换个问题。")
 
 
 def main():
     _acquire_process_lock()
+    if queue_enabled():
+        from bot.redis_client import require_redis
+
+        require_redis()
+        settings = worker_settings()
+        lark.logger.info(
+            "Queue mode enabled: cpu=%s workers=%s mysql_budget=%s/%s",
+            settings.cpu_count,
+            settings.worker_count,
+            settings.db_connection_budget,
+            settings.max_db_connection_budget,
+        )
     event_handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(do_p2_im_message_receive_v1)

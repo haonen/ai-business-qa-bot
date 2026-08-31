@@ -1,0 +1,21 @@
+[Unit]
+Description=AI Business QA Bot RQ Worker Pool
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ai-business-qa-bot
+EnvironmentFile=/root/ai-business-qa-bot/.env
+Environment=BOT_SESSION_BACKEND=redis
+Environment=BOT_WORKER_ROLE=analysis
+ExecStart=/root/ai-business-qa-bot/.venv/bin/python -m bot.worker_pool
+Restart=always
+RestartSec=5
+TimeoutStopSec=330
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

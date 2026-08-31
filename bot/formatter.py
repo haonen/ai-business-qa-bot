@@ -30,6 +30,8 @@ def _llm_client():
     return OpenAI(
         api_key=os.environ["DASHSCOPE_API_KEY"],
         base_url=os.environ.get("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        max_retries=1,
+        timeout=float(os.environ.get("LLM_REQUEST_TIMEOUT", "30")),
     )
 
 

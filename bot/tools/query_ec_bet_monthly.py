@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from bot.db.connection import fetch_df
 
 from bot.media_period import parse_media_period
+from bot.runtime_config import bounded_query_workers
 from bot.tools.common import tool
 from bot.tools.followup_common import month_keys, standard_result
 from bot.tools.query_bet_followup_table import query_bet_followup_table
@@ -52,7 +53,7 @@ def query_ec_bet_monthly(
     """Align monthly EC and BET evidence; returns signals, never causal claims."""
     try:
         parsed = parse_media_period(period)
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="followup-link") as executor:
+        with ThreadPoolExecutor(max_workers=bounded_query_workers(4), thread_name_prefix="followup-link") as executor:
             tasks = {
                 "ec": executor.submit(_query_tmall_ttl_monthly, (source_brands or {}).get("tmall"), parsed),
                 "media": executor.submit(query_bet_followup_table, brand, period, ["month"], {}, ["spend_actual", "spend_evol", "nso_actual", "nso_evol", "fee_ratio", "fee_ratio_change"], 50, source_brands),

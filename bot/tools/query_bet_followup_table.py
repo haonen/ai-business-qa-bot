@@ -4,6 +4,7 @@ import pandas as pd
 
 from bot.db.connection import fetch_df
 from bot.media_period import parse_media_period
+from bot.platforms import canonical_platform, platform_filter_sql
 from bot.tools.common import tool
 from bot.tools.followup_common import month_keys, standard_result
 from bot.tools.query_media_investment import _CHANNEL_RULES
@@ -57,7 +58,7 @@ def _merge_rows(df: pd.DataFrame, dims: list[str], value_columns: list[str]) -> 
 
 def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tuple[list[dict], dict, dict]:
     df = fetch_df(
-        """
+        f"""
         SELECT
           CASE WHEN CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
           CAST(period_month AS DATE) AS period_month, ait_roe AS ait, media, submedia,
@@ -81,26 +82,38 @@ def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tupl
     if filters.get("ait"):
         df = df[df["ait"].fillna("").astype(str).str.casefold() == str(filters["ait"]).casefold()]
     requested_platform = str(filters.get("platform") or "").casefold()
+    requested_commerce_platform = ""
+    if requested_platform:
+        try:
+            requested_commerce_platform = canonical_platform(
+                requested_platform, allow_ttl=False
+            )
+        except ValueError:
+            pass
     platform_breakdown = (
-        ("platform" in group_by or requested_platform in {"tmall", "douyin", "jd"})
+        ("platform" in group_by or requested_commerce_platform in {"TM", "DY", "JD"})
         and "bkfst" not in group_by
     )
     if platform_breakdown:
         transaction = raw[raw["ait"].fillna("").astype(str).str.casefold() == "transaction"].copy()
         parts = []
-        for key, label in (("tmall", "TMALL"), ("douyin", "Douyin"), ("jd", "JD")):
+        for key, label in (("tmall", "TM"), ("douyin", "DY"), ("jd", "JD")):
             rule = _CHANNEL_RULES[key]
             mask = [rule(str(m or "").strip().casefold(), str(s or "").strip().casefold()) for m, s in zip(transaction["media"], transaction["submedia"])]
             piece = transaction.loc[mask].copy()
             piece["platform"] = label
             parts.append(piece)
         df = pd.concat(parts, ignore_index=True) if parts else transaction.iloc[0:0]
-        if filters.get("platform") and str(filters["platform"]).casefold() not in {"red", "xiaohongshu"}:
-            df = df[df["platform"].str.casefold() == str(filters["platform"]).casefold()]
+        if requested_commerce_platform:
+            df = df[df["platform"] == requested_commerce_platform]
     bkfst_source_column = None
     if "bkfst" in group_by or filters.get("bkfst"):
         scope = str(filters.get("platform") or "overall").casefold()
-        column = "bkfs_xiaohongshu" if scope in {"red", "xiaohongshu"} else ("bkfs_douyin" if scope == "douyin" else "bkfs_overall")
+        try:
+            scope = canonical_platform(scope, allow_ttl=False, allow_red=True)
+        except ValueError:
+            scope = "OVERALL"
+        column = "bkfs_xiaohongshu" if scope == "RED" else ("bkfs_douyin" if scope == "DY" else "bkfs_overall")
         bkfst_source_column = column
         valid_bkfst = df[column].notna() & df[column].astype(str).str.strip().ne("")
         df = df[valid_bkfst].copy()
@@ -137,11 +150,11 @@ def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tupl
 
 def _query_nso(brand: str, parsed) -> pd.DataFrame:
     return fetch_df(
-        """
+        f"""
         SELECT CASE WHEN year = :current_year THEN 'current' ELSE 'prior' END AS period_key,
                year, month, SUM(Sales) AS nso, COUNT(*) AS row_count
         FROM top_brands_total_ec
-        WHERE Brand = :brand AND platform = 'TTL'
+        WHERE Brand = :brand AND {platform_filter_sql('top_brands_total_ec', 'TTL')}
           AND ((year = :current_year AND month BETWEEN :current_start_month AND :current_end_month)
             OR (year = :prior_year AND month BETWEEN :prior_start_month AND :prior_end_month))
         GROUP BY period_key, year, month
@@ -202,7 +215,13 @@ def _query_kol(brand: str, parsed, group_by: list[str], filters: dict) -> tuple[
     df["month"] = df.apply(lambda r: _aligned_month(r["period_month"], r["period_key"]), axis=1)
     if filters.get("platform"):
         values = filters["platform"] if isinstance(filters["platform"], list) else [filters["platform"]]
-        normalized = {str(value).casefold() for value in values}
+        normalized = set()
+        for value in values:
+            try:
+                canonical = canonical_platform(value, allow_ttl=False, allow_red=True)
+                normalized.add("douyin" if canonical == "DY" else "red" if canonical == "RED" else canonical.casefold())
+            except ValueError:
+                normalized.add(str(value).casefold())
         df = df[df["kol_platform"].fillna("").astype(str).str.casefold().isin(normalized)]
     denominator_source = df.copy()
     for field in ("tier", "kol_type"):

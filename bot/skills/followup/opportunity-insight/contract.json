@@ -1,0 +1,26 @@
+{
+  "name": "opportunity_insight",
+  "consumes": ["ec_report_evidence.v2", "analysis_drill_bundle"],
+  "evidence_dimensions": ["category", "key_driver", "series", "sku", "bet_signal"],
+  "candidate_rules": {
+    "min_share_of_total": 0.03,
+    "min_positive_share_delta_pp": 3,
+    "min_positive_evol": 0.1,
+    "max_candidates_per_dimension": 3
+  },
+  "forbidden_causal_words": [
+    "会带来增长", "能提升GMV", "证明了", "导致了增长", "带来了增长",
+    "一定能", "必然会", "保证", "肯定会"
+  ],
+  "hedge_words_required_in_bullet": ["值得关注", "可以考虑", "建议", "或许", "可能"],
+  "output": {
+    "max_bullets": 5,
+    "min_bullets": 1,
+    "citation_required": true,
+    "each_bullet_must_reference": "candidate_id"
+  },
+  "tools": [
+    "context_ec_report_evidence", "query_ec_followup_table", "query_bet_followup_table",
+    "query_change_contribution", "query_ec_bet_monthly"
+  ]
+}

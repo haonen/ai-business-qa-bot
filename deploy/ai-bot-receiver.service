@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Business QA Bot Feishu Receiver
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ai-business-qa-bot
+EnvironmentFile=/root/ai-business-qa-bot/.env
+ExecStart=/root/ai-business-qa-bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+

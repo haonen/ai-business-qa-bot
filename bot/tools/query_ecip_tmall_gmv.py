@@ -8,9 +8,8 @@ from bot.utils import safe_evol
 
 _TTL_CATEGORY_VALUES = (
     "Skincare",
+    "Makeup",
     "Hair",
-    "Makeup + Fragrance",
-    "Makeup+Fragrance",
 )
 
 
@@ -39,7 +38,7 @@ def query_ecip_tmall_gmv(
                 "message": (
                     f"品牌“{context['source_brand']}”在ECIP MASS Pure Mass Market "
                     "Ranking (TTL Beauty)本期没有"
-                    "Skincare、Hair或Makeup + Fragrance数据，报告未生成。"
+                    "Skincare、Makeup或Hair数据，报告未生成。"
                 ),
             }
         if prior["row_count"] == 0:
@@ -48,7 +47,7 @@ def query_ecip_tmall_gmv(
                 "message": (
                     f"品牌“{context['source_brand']}”在ECIP MASS Pure Mass Market "
                     "Ranking (TTL Beauty)去年同期没有"
-                    "Skincare、Hair或Makeup + Fragrance数据，报告未生成。"
+                    "Skincare、Makeup或Hair数据，报告未生成。"
                 ),
             }
         return {

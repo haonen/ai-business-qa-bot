@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -48,23 +49,23 @@ class JdSourceSelectionTest(unittest.TestCase):
         self.assertIn(JD_DAILY_TABLE, sql)
         self.assertNotIn("TRIM(platform)", sql)
 
-    @patch("bot.tools.query_jd_business._fetch_category_slice")
-    def test_complete_month_queries_daily_once_per_period(self, query_slice):
-        current = pd.DataFrame([{
-            "period_key": "current", "category_level_3": "面霜", "gmv": 100, "row_count": 1,
-        }])
-        prior = pd.DataFrame([{
-            "period_key": "prior", "category_level_3": "面霜", "gmv": 80, "row_count": 1,
-        }])
-        query_slice.side_effect = [current, prior]
+    @patch("bot.tools.query_jd_business.fetch_df")
+    def test_multi_month_category_query_is_batched_once(self, fetch_df):
+        fetch_df.return_value = pd.DataFrame([
+            {"period_key": "current", "source_month": "2026-05", "category_level_3": "面霜", "gmv": 40, "row_count": 1},
+            {"period_key": "current", "source_month": "2026-06", "category_level_3": "面霜", "gmv": 60, "row_count": 1},
+            {"period_key": "prior", "source_month": "2025-05", "category_level_3": "面霜", "gmv": 30, "row_count": 1},
+            {"period_key": "prior", "source_month": "2025-06", "category_level_3": "面霜", "gmv": 50, "row_count": 1},
+        ])
         frame, sources, missing = _query_category_frames("PROYA", {
-            "current_start": "2026-06-01", "current_end": "2026-06-30",
-            "prior_start": "2025-06-01", "prior_end": "2025-06-30",
+            "current_start": "2026-05-01", "current_end": "2026-06-30",
+            "prior_start": "2025-05-01", "prior_end": "2025-06-30",
         })
         self.assertFalse(frame.empty)
         self.assertFalse(missing)
-        self.assertEqual([row["source"] for row in sources], ["daily", "daily"])
-        self.assertTrue(all(call.kwargs["table"] == JD_DAILY_TABLE for call in query_slice.call_args_list))
+        self.assertEqual(fetch_df.call_count, 1)
+        self.assertEqual(len(sources), 4)
+        self.assertTrue(all(row["table"] == JD_DAILY_TABLE for row in sources))
 
 
 class JdMetricTest(unittest.TestCase):
@@ -90,6 +91,13 @@ class JdMetricTest(unittest.TestCase):
 
 
 class JdReportAndRouteTest(unittest.TestCase):
+    def test_business_performance_wording_routes_directly_to_jd(self):
+        routed = route("OKCS在2026年1月至3月在京东的生意表现", SessionState())
+        self.assertEqual(routed.type, "jd_business_analysis")
+        self.assertEqual(routed.brand, "OKCS")
+        self.assertEqual(routed.period, "2026年1月至3月")
+        self.assertEqual(routed.platform, "JD")
+
     def test_explicit_trigger_routes_to_jd_report(self):
         routed = route("生成珀莱雅2026年6月京东品牌生意分析", SessionState())
         self.assertEqual(routed.type, "jd_business_analysis")
@@ -124,9 +132,16 @@ class JdReportAndRouteTest(unittest.TestCase):
         self.assertEqual(parsed["current_end"], "2026-06-30")
 
     def test_market_and_media_questions_do_not_trigger_jd_report(self):
-        market = route("2026年1-6月京东大盘怎么样", SessionState())
-        media = route("分析2026年3月京东媒体花费", SessionState())
-        self.assertEqual(market.type, "market_analysis")
+        with patch.dict(os.environ, {
+            "ROUTER_V2_ENABLED": "1", "ENTITY_RESOLVER_V2_ENABLED": "1",
+        }, clear=False):
+            market = route("2026年1-6月京东大盘怎么样", SessionState())
+            media = route("分析2026年3月京东媒体花费", SessionState())
+        self.assertEqual(market.type, "clarify_market_scope")
+        self.assertEqual(
+            set(market.route_decision["missing_slots"]),
+            {"market_scope.segment", "market_scope.category"},
+        )
         self.assertNotEqual(media.type, "jd_business_analysis")
 
     def test_report_unifies_formats_and_omits_links_and_source_notes(self):

@@ -5,7 +5,7 @@ from datetime import date, datetime
 import calendar
 import re
 
-from bot.utils import normalize_period_hint, parse_period
+from bot.utils import normalize_period_hint, parse_ec_period, parse_period
 
 
 _RANGE_SEP = r"[~～—–\-至到]+"
@@ -117,9 +117,27 @@ def normalize_media_period_hint(text: str) -> str | None:
 
 
 def parse_media_period(period: str) -> MediaPeriod:
+    resolved_start = getattr(period, "start_date", None)
+    resolved_end = getattr(period, "end_date", None)
+    if resolved_start and resolved_end:
+        return _build(
+            date.fromisoformat(resolved_start),
+            date.fromisoformat(resolved_end),
+        )
     raw = (period or "").strip()
     if not raw:
         raise ValueError("缺少媒体分析时间。")
+
+    if re.fullmatch(
+        r"(?:(?:20\d{2})年?\s*)?(?:YTD|MTD|年初至今|本月至今|今年以来)",
+        raw,
+        re.I,
+    ):
+        parsed = parse_ec_period(raw, date.today().year)
+        return _build(
+            date.fromisoformat(parsed["current_start"]),
+            date.fromisoformat(parsed["current_end"]),
+        )
 
     month_range = re.fullmatch(
         rf"(20\d{{2}})年(\d{{1,2}})月?{_RANGE_SEP}(?:(20\d{{2}})年)?(\d{{1,2}})月",
@@ -189,3 +207,25 @@ def period_from_latest_month(value: str | date | datetime) -> MediaPeriod:
     else:
         parsed = value
     return _build(_month_start(parsed.year, parsed.month), _month_end(parsed.year, parsed.month))
+
+
+def cap_period_to_latest_month(period: MediaPeriod, value: str | date | datetime) -> MediaPeriod:
+    """Return a report period capped to the latest available month.
+
+    If the whole requested range is later than availability, return the latest
+    available month itself so the user still receives the newest BET report.
+    """
+    if isinstance(value, str):
+        latest = datetime.strptime(value[:10], "%Y-%m-%d").date()
+    elif isinstance(value, datetime):
+        latest = value.date()
+    else:
+        latest = value
+    latest_end = _month_end(latest.year, latest.month)
+    requested_start = date.fromisoformat(period.focus_start)
+    requested_end = date.fromisoformat(period.focus_end)
+    if latest_end >= requested_end:
+        return period
+    if latest_end < requested_start:
+        return _build(_month_start(latest.year, latest.month), latest_end)
+    return _build(requested_start, latest_end)

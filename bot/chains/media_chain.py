@@ -10,13 +10,15 @@ from bot.media_brand import (
     resolve_source_brand,
 )
 from bot.media_formatter import format_media_report
-from bot.media_period import parse_media_period, period_from_latest_month
+from bot.media_period import cap_period_to_latest_month, parse_media_period, period_from_latest_month
+from bot.runtime_config import bounded_query_workers
 from bot.tools import (
     query_ec_nso,
     query_kol_performance,
     query_media_investment,
     query_social_search,
 )
+from bot.tools.query_media_investment import latest_media_investment_month
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +29,8 @@ def run_media_chain(
     *,
     brand_aliases: list[str] | None = None,
     media_scope: str | None = None,
+    media_mode: str | None = None,
+    media_channels: list[str] | None = None,
     on_progress=None,
 ) -> dict:
     started_at = time.perf_counter()
@@ -85,8 +89,24 @@ def run_media_chain(
     )
 
     try:
+        period_adjustment = None
         if period:
             parsed = parse_media_period(period)
+            requested = parsed
+            latest_topline = (
+                latest_media_investment_month(resolved["topline"], int(parsed.focus_start[:4]))
+                if resolved.get("topline") else None
+            )
+            if latest_topline:
+                parsed = cap_period_to_latest_month(parsed, latest_topline)
+                if parsed.canonical != requested.canonical:
+                    period_adjustment = {
+                        "requested_period": requested.canonical,
+                        "requested_display": requested.display,
+                        "effective_period": parsed.canonical,
+                        "effective_display": parsed.display,
+                        "latest_available_month": latest_topline[:7],
+                    }
         else:
             latest = latest_common_month(resolved)
             if not latest:
@@ -127,7 +147,7 @@ def run_media_chain(
         "prior_end": parsed.prior_end,
     }
     results = {}
-    with ThreadPoolExecutor(max_workers=5, thread_name_prefix="bet-query") as executor:
+    with ThreadPoolExecutor(max_workers=bounded_query_workers(5), thread_name_prefix="bet-query") as executor:
         futures = {}
         if resolved.get("search"):
             futures["search"] = executor.submit(
@@ -220,6 +240,9 @@ def run_media_chain(
         douyin_result=douyin_result,
         resolved_brands=resolved,
         brand_match_methods=match_methods,
+        media_mode=media_mode,
+        media_channels=media_channels,
+        period_adjustment=period_adjustment,
     )
     log.info(
         "[media_chain] completed brand=%s total_elapsed=%.3fs",
@@ -238,6 +261,9 @@ def run_media_chain(
             "resolved_brands": resolved,
             "brand_match_methods": match_methods,
             "media_scope": media_scope or "full_bet",
+            "media_mode": media_mode or "OVERALL_BET",
+            "media_channels": list(media_channels or []),
+            "period_adjustment": period_adjustment,
             "last_result_cache": {
                 "search_result": search_result,
                 "investment_result": investment_result,

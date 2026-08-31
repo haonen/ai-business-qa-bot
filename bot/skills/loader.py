@@ -15,6 +15,7 @@ SKILL_FILES = {
     "playbook_read": "playbook_read.md",
     "media_analysis": "media_analysis.md",
     "market_analysis": "market_analysis.md",
+    "three_platform_competitor": "three_platform_competitor.md",
 }
 
 

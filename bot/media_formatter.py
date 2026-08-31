@@ -780,8 +780,34 @@ def format_media_report(
     douyin_result: dict,
     resolved_brands: dict,
     brand_match_methods: dict | None = None,
+    media_mode: str | None = None,
+    media_channels: list[str] | None = None,
+    period_adjustment: dict | None = None,
 ) -> str:
-    return "\n".join([
+    coverage_notice = []
+    if period_adjustment:
+        latest = period_adjustment.get("latest_available_month") or ""
+        latest_month = int(latest[-2:]) if len(latest) >= 7 else latest
+        coverage_notice = [
+            "> **数据覆盖提示**：你请求的是"
+            f"{period_adjustment.get('requested_display')}；Topline BET数据最新到"
+            f"{latest_month}月，本报告已自动按"
+            f"{period_adjustment.get('effective_display')}输出完整可用分析。",
+            "",
+        ]
+    channels = {str(channel).upper() for channel in (media_channels or [])}
+    if media_mode == "CHANNEL_ONLY":
+        sections = [
+            f"# {display_brand} Douyin相关BET分析",
+            "",
+            "> _本报告按用户确认的媒体渠道范围输出，仅呈现对应渠道可观测数据；不推断媒体投放导致电商GMV变化。_",
+        ]
+        if "DOUYIN" in channels:
+            sections.extend(["", _render_kol_platform(douyin_result, "DOUYIN", "1")])
+        if "RED" in channels:
+            sections.extend(["", _render_kol_platform(red_result, "RED", "1")])
+        return "\n".join(coverage_notice + sections)
+    return "\n".join(coverage_notice + [
         _render_media(investment_result, nso_result),
         "",
         "# 2. KOL Performance",

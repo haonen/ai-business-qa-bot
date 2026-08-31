@@ -22,7 +22,7 @@
 | 商品、产品系列、渠道内系列、Top 5链接 | `dy_goodssales_rank_day_jiashicang` | `dy_goodssales_rank_day_jiashicang` |
 
 本期和同期逐月独立选择日表或月表；同一个自然月不能重复使用两个来源。
-月表`three_platform_store_rank_monthly.bus_date`按`YYYY-01-MM`编码，查询前必须恢复为业务月份`YYYY-MM-01`，不能直接当自然日期筛选。
+月表`three_platform_store_rank_monthly.bus_date`是正常自然日期，年月按`YEAR(bus_date)`和`MONTH(bus_date)`读取，不得用`DAY(bus_date)`代表月份。常用美妆业务口径筛选`clear_category_status IN ('female skincare','Makeup','Hair','male skincare')`。`clear_category_status='TTL'`还包含其他范围，不能当成这四类的简单合计。
 
 ## 字段
 
@@ -75,7 +75,7 @@
 
 1. 品牌整体GMV。
 2. 所有四级类目：本期GMV、同比、本期品牌GMV占比、占比变化pp。
-3. 仅下钻本期GMV第一的四级类目：各系列本期GMV、同比、类目内占比、占比变化pp。
+3. 商品模块不按月表类目下钻；直接在品牌全部商品范围内展示各系列本期GMV、同比、品牌商品GMV占比和占比变化pp。
 4. 三渠道生意：KOL直播、品牌自营直播、短视频及其他。
 5. 每个渠道的GMV最高产品系列。
 6. 每个渠道的Top 5商品链接及Top 5集中度。

@@ -20,6 +20,7 @@ from bot.media_brand import (
     ResolvedBrands,
     _select_source_mappings,
     _validate_selected_brand,
+    configured_brand_alias,
     resolve_media_brand,
 )
 from bot.media_period import normalize_media_period_hint, parse_media_period
@@ -34,6 +35,12 @@ from bot.utils import detect_brand_hint, normalize_period_hint, parse_period
 
 
 class MediaPeriodTest(unittest.TestCase):
+    def test_ytd_and_mtd_are_supported(self):
+        ytd = parse_media_period("2026年YTD")
+        mtd = parse_media_period("2026年MTD")
+        self.assertEqual(ytd.focus_start, "2026-01-01")
+        self.assertEqual(mtd.focus_start[0:8], mtd.focus_end[0:8])
+
     def test_single_month_uses_ytd_search(self):
         parsed = parse_media_period("2026年3月")
         self.assertEqual(parsed.focus_start, "2026-03-01")
@@ -62,6 +69,10 @@ class FeishuDocRetryTest(unittest.TestCase):
         sleep.assert_called_once()
 
 class SharedPeriodTest(unittest.TestCase):
+    def test_to_date_spellings_are_normalized(self):
+        self.assertEqual(normalize_period_hint("2026年YTD 天猫top5"), "2026年YTD")
+        self.assertEqual(normalize_period_hint("本月至今抖音生意"), "本月至今")
+
     def test_supported_period_spellings_are_normalized(self):
         cases = {
             "美宝莲2026 1-6生意情况": "2026年1-6月",
@@ -185,9 +196,9 @@ class MediaRouterTest(unittest.TestCase):
         self.assertEqual(result.followup_text, "KOL performance如何")
 
     @patch("bot.router.classify_user_intent", return_value=None)
-    def test_tmall_route_understands_month_without_year(self, _mock_intent):
+    def test_business_route_without_platform_asks_for_platform(self, _mock_intent):
         result = route("谷雨5月的生意如何", SessionState())
-        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(result.type, "clarify_ec_platform")
         self.assertEqual(result.brand, "谷雨")
         self.assertEqual(result.period, "5月")
 
@@ -203,7 +214,7 @@ class DefaultChainFailureTest(unittest.TestCase):
 
 class MediaToolTest(unittest.TestCase):
     @patch("bot.tools.query_media_investment.fetch_df")
-    def test_media_investment_refuses_range_when_latest_month_is_missing(self, mock_fetch):
+    def test_media_investment_uses_latest_available_trailing_month(self, mock_fetch):
         mock_fetch.return_value = pd.DataFrame([
             {
                 "year": 2026, "period_month": f"2026-{month:02d}-01",
@@ -216,9 +227,11 @@ class MediaToolTest(unittest.TestCase):
         result = query_media_investment(
             "KANS", "2026-01-01", "2026-06-30", "2025-01-01", "2025-06-30"
         )
-        self.assertEqual(result["error"], "requested_period_incomplete")
+        self.assertNotIn("error", result)
         self.assertEqual(result["coverage"]["missing_current_months"], ["2026-06"])
-        self.assertIn("BET花费数据尚未覆盖6月", result["message"])
+        self.assertTrue(result["coverage"]["period_adjusted"])
+        self.assertEqual(result["coverage"]["effective_focus_end"], "2026-05-31")
+        self.assertEqual(result["ttl"]["actual_million"], 5.0)
 
     @patch("bot.tools.query_social_search.fetch_df")
     def test_search_keeps_category_month_separate(self, mock_fetch):
@@ -309,7 +322,7 @@ class MediaToolTest(unittest.TestCase):
         self.assertEqual(result["evol"], 0.25)
         sql = mock_fetch.call_args.args[0]
         self.assertIn("FROM top_brands_total_ec", sql)
-        self.assertIn("platform = 'TTL'", sql)
+        self.assertIn("UPPER(TRIM(platform)) IN ('TTL')", sql)
 
     @patch("bot.tools.query_douyin_gmv.fetch_df")
     def test_douyin_gmv_uses_sales_amount_field(self, mock_fetch):
@@ -457,6 +470,36 @@ class MediaBrandTest(unittest.TestCase):
         self.addCleanup(index_patcher.stop)
         self.addCleanup(alias_patcher.stop)
 
+    @patch("bot.media_brand._load_aliases", return_value={
+        "谷雨": {"topline": "GRAIN RAIN", "ksi": "GRAIN RAIN", "nso": "GUYU"},
+    })
+    def test_guyu_has_source_specific_configured_names(self, _mock_aliases):
+        self.assertEqual(configured_brand_alias("谷雨", "topline"), "GRAIN RAIN")
+        self.assertEqual(configured_brand_alias("谷雨", "ksi"), "GRAIN RAIN")
+        self.assertEqual(configured_brand_alias("谷雨", "nso"), "GUYU")
+
+    @patch("bot.media_brand._generate_brand_variants", return_value=("谷雨", "GUYU", "GRAIN RAIN"))
+    @patch("bot.media_brand._dictionary_rows")
+    @patch("bot.media_brand._read_resolution_cache", return_value=None)
+    def test_router_alias_does_not_suppress_source_specific_variant(
+        self, _mock_cache, mock_dictionary, mock_variants,
+    ):
+        mock_dictionary.side_effect = [
+            [],
+            [
+                {"source_name": "topline", "source_brand": "GRAIN RAIN", "normalized_brand": "grainrain"},
+                {"source_name": "ksi", "source_brand": "GRAIN RAIN", "normalized_brand": "grainrain"},
+            ],
+        ]
+
+        result = resolve_media_brand("谷雨", brand_aliases=["谷雨", "GUYU"])
+
+        fallback_values = mock_dictionary.call_args_list[1].args[0]
+        self.assertIn("grainrain", fallback_values)
+        self.assertEqual(result["resolved"]["topline"], "GRAIN RAIN")
+        self.assertEqual(result["resolved"]["ksi"], "GRAIN RAIN")
+        mock_variants.assert_called_once_with("谷雨")
+
     @patch("bot.media_brand._generate_brand_variants")
     @patch("bot.media_brand._dictionary_rows")
     @patch("bot.media_brand._read_resolution_cache", return_value=None)
@@ -504,6 +547,28 @@ class MediaBrandTest(unittest.TestCase):
         self.assertEqual(result["resolved"]["search"], "珀莱雅")
         self.assertEqual(result["resolved"]["tmall"], "珀莱雅")
         self.assertEqual(result["resolved"]["dy"], "珀莱雅")
+        mock_write.assert_called_once()
+
+    @patch("bot.media_brand._dictionary_rows")
+    @patch("bot.media_brand._read_resolution_cache", return_value=None)
+    @patch("bot.media_brand._write_resolution_cache")
+    def test_chinese_reference_is_used_only_after_exact_dictionary_miss(
+        self, mock_write, _mock_cache, mock_dictionary,
+    ):
+        reference_rows = [
+            {"source_name": source, "source_brand": "PROYA", "normalized_brand": "proya"}
+            for source in ("search", "topline", "ksi", "tmall", "dy")
+        ]
+        mock_dictionary.side_effect = [[], reference_rows]
+
+        result = resolve_media_brand("珀莱雅")
+
+        first_names = mock_dictionary.call_args_list[0].args[0]
+        fallback_names = mock_dictionary.call_args_list[1].args[0]
+        self.assertEqual(first_names, ("珀莱雅",))
+        self.assertIn("proya", fallback_names)
+        self.assertEqual(set(result["resolved"].values()), {"PROYA"})
+        self.assertEqual(set(result["match_methods"].values()), {"cn_en_reference"})
         mock_write.assert_called_once()
 
     @patch("bot.media_brand._dictionary_rows")
@@ -602,6 +667,7 @@ class MediaChainIntegrityTest(unittest.TestCase):
         mock_nso.assert_not_called()
         mock_resolve_nso.assert_not_called()
 
+    @patch("bot.chains.media_chain.latest_media_investment_month", return_value="2026-03-01")
     @patch("bot.chains.media_chain.format_media_report", return_value="# partial report")
     @patch("bot.chains.media_chain.query_ec_nso")
     @patch("bot.chains.media_chain.query_kol_performance")
@@ -611,7 +677,7 @@ class MediaChainIntegrityTest(unittest.TestCase):
     @patch("bot.chains.media_chain.resolve_media_brand")
     def test_missing_one_source_still_queries_available_sources(
         self, mock_resolve, mock_resolve_nso, mock_search, mock_investment,
-        mock_kol, mock_nso, mock_format
+        mock_kol, mock_nso, mock_format, _mock_latest
     ):
         mock_resolve.return_value = {
             "resolved": {
@@ -651,6 +717,7 @@ class MediaChainIntegrityTest(unittest.TestCase):
         search_result = mock_format.call_args.kwargs["search_result"]
         self.assertEqual(search_result["error"], "source_unavailable")
 
+    @patch("bot.chains.media_chain.latest_media_investment_month", return_value="2026-03-01")
     @patch("bot.chains.media_chain.format_media_report", return_value="# report")
     @patch("bot.chains.media_chain.query_ec_nso")
     @patch("bot.chains.media_chain.query_kol_performance")
@@ -660,7 +727,7 @@ class MediaChainIntegrityTest(unittest.TestCase):
     @patch("bot.chains.media_chain.resolve_media_brand")
     def test_five_tools_run_in_parallel_with_resolved_values(
         self, mock_resolve, mock_resolve_nso, mock_search, mock_investment,
-        mock_kol, mock_nso, _mock_format
+        mock_kol, mock_nso, _mock_format, _mock_latest
     ):
         mock_resolve.return_value = {
             "resolved": {
@@ -698,8 +765,51 @@ class MediaChainIntegrityTest(unittest.TestCase):
         self.assertEqual(mock_search.call_args.kwargs["brand"], "珀莱雅")
         self.assertEqual(mock_nso.call_args.kwargs["brand"], "PROYA")
 
+    @patch("bot.chains.media_chain.latest_media_investment_month", return_value="2026-05-01")
+    @patch("bot.chains.media_chain.format_media_report", return_value="# report")
+    @patch("bot.chains.media_chain.query_ec_nso", return_value={})
+    @patch("bot.chains.media_chain.query_kol_performance", return_value={})
+    @patch("bot.chains.media_chain.query_media_investment", return_value={})
+    @patch("bot.chains.media_chain.query_social_search", return_value={})
+    @patch("bot.chains.media_chain.resolve_source_brand")
+    @patch("bot.chains.media_chain.resolve_media_brand")
+    def test_requested_range_is_capped_to_latest_topline_month(
+        self, mock_resolve, mock_resolve_nso, mock_search, mock_investment,
+        mock_kol, mock_nso, mock_format, _mock_latest,
+    ):
+        mock_resolve.return_value = {
+            "resolved": {"search": "韩束", "topline": "KANS", "ksi": "KANS"},
+            "match_methods": {"search": "cache", "topline": "cache", "ksi": "cache"},
+        }
+        mock_resolve_nso.return_value = {"brand": "KANS", "match_method": "cache"}
+
+        result = run_media_chain("韩束", "2026年1-6月")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["meta"]["period"], "2026年1-5月")
+        self.assertEqual(result["meta"]["period_adjustment"]["requested_period"], "2026年1-6月")
+        self.assertEqual(mock_investment.call_args.kwargs["focus_end"], "2026-05-31")
+        self.assertEqual(mock_search.call_args.kwargs["end_month"], "2026-05-31")
+        self.assertEqual(mock_nso.call_args.kwargs["focus_end"], "2026-05-31")
+        self.assertEqual(mock_format.call_args.kwargs["period_adjustment"]["effective_display"], "2026年1–5月")
+
 
 class MediaFormatterTest(unittest.TestCase):
+    def test_report_leads_with_automatic_coverage_adjustment(self):
+        report = format_media_report(
+            "韩束", parse_media_period("2026年1-5月").to_dict(),
+            {}, {}, {}, {}, {},
+            {"search": "韩束", "topline": "KANS", "ksi": "KANS", "nso": "KANS"},
+            period_adjustment={
+                "requested_display": "2026年1–6月",
+                "effective_display": "2026年1–5月",
+                "latest_available_month": "2026-05",
+            },
+        )
+        self.assertTrue(report.startswith("> **数据覆盖提示**"))
+        self.assertIn("Topline BET数据最新到5月", report)
+        self.assertIn("已自动按2026年1–5月输出", report)
+
     def test_media_table_keeps_all_nine_columns(self):
         headers = [
             "类型", "媒体花费Actual", "花费Evol%", "媒体花费Wgt%",

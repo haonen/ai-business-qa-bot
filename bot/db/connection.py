@@ -36,8 +36,9 @@ def get_engine():
         _ENGINE = create_engine(
             url,
             pool_pre_ping=True,
-            pool_size=int(os.environ.get("MYSQL_POOL_SIZE", "8")),
-            max_overflow=int(os.environ.get("MYSQL_MAX_OVERFLOW", "4")),
+            pool_size=int(os.environ.get("MYSQL_POOL_SIZE", "3")),
+            max_overflow=int(os.environ.get("MYSQL_MAX_OVERFLOW", "1")),
+            pool_timeout=int(os.environ.get("MYSQL_POOL_TIMEOUT", "10")),
             pool_recycle=int(os.environ.get("MYSQL_POOL_RECYCLE", "1800")),
             connect_args={
                 "connect_timeout": int(os.environ.get("MYSQL_CONNECT_TIMEOUT", "10")),

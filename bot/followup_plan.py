@@ -12,6 +12,9 @@ from bot.media_period import normalize_media_period_hint
 from bot.media_period import parse_media_period
 from bot.session import SessionState
 from bot.utils import extract_json_object, llm_client, normalize_period_hint, parse_ec_period
+from bot.key_driver_ontology import detect_key_drivers, has_explicit_media_intent
+from bot.ec_report_evidence import evidence_from_cache
+from bot.opportunity_insight import asks_for_opportunity
 
 
 log = logging.getLogger(__name__)
@@ -24,10 +27,12 @@ _CONTRACTS = {
 NARROW_HINTS = (
     "按月", "by month", "整理", "列出", "表格", "趋势", "排名", "top", "对比", "比较",
     "拖累", "贡献", "构成", "靠哪些", "性价比", "同步", "背离", "有没有涨",
+    "再帮我分析", "再分析", "继续分析", "下钻", "这个品类", "该品类",
+    "这个系列", "该系列", "这个driver", "该driver", "top链接", "商品标题",
 )
 BET_HINTS = (
     "媒体", "费比", "take rate", "take-rate", "take_rate", "bet%",
-    "ait", "bkfs", "bkfst", "search", "搜索", "kol", "达人", "engage", "cpe", "投放",
+    "ait", "bkfs", "bkfst", "search", "搜索", "engage", "cpe", "投放",
 )
 EC_HINTS = ("生意", "gmv", "品类", "类目", "系列", "链接", "sku", "key driver", "渠道", "功能线")
 EC_METRICS = {"gmv_actual", "gmv_evol", "unit_actual", "unit_evol", "atv_actual"}
@@ -46,6 +51,7 @@ class FollowupPlan:
     mode: str
     brand: str
     period: dict[str, str]
+    platform: str | None = None
     filters: dict[str, str | None] = field(default_factory=dict)
     group_by: list[str] = field(default_factory=list)
     metrics: list[str] = field(default_factory=list)
@@ -56,7 +62,8 @@ class FollowupPlan:
     def to_dict(self) -> dict:
         return {
             "skill": self.skill, "domain": self.domain, "mode": self.mode,
-            "brand": self.brand, "period": self.period, "filters": self.filters,
+            "brand": self.brand, "period": self.period, "platform": self.platform,
+            "filters": self.filters,
             "group_by": self.group_by, "metrics": self.metrics,
             "comparison": self.comparison, "sort": self.sort, "limit": self.limit,
         }
@@ -64,7 +71,7 @@ class FollowupPlan:
 
 def is_narrow_followup(text: str) -> bool:
     lowered = str(text or "").casefold()
-    return any(h.casefold() in lowered for h in NARROW_HINTS)
+    return any(h.casefold() in lowered for h in NARROW_HINTS) or asks_for_opportunity(text)
 
 
 def _mentions_fee_ratio(text: str) -> bool:
@@ -78,10 +85,38 @@ def _mentions_fee_ratio(text: str) -> bool:
 def _mentions_media_spend(text: str) -> bool:
     lowered = str(text or "").casefold()
     return (
-        any(token in lowered for token in ("媒体花费", "媒体投资", "媒体费用", "media spend", "spend"))
+        any(token in lowered for token in (
+            "媒体花费", "媒体投资", "媒体费用", "media spend", "spend",
+            "费用增长", "费用同比", "费用增加", "费用上涨", "费用下降", "费用减少",
+        ))
         # 在数字追问里，单独的 BET/AIT 指媒体花费；BET% 仍是媒体费比。
         or bool(re.search(r"(?<![a-z0-9])(?:bet|ait)(?![a-z0-9%])", lowered))
     )
+
+
+def requests_web_search(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return any(token in lowered for token in (
+        "去搜索", "搜索一下", "网上搜索", "联网搜索", "上网查", "网上查",
+        "查一下期间", "期间发生了什么", "发生了什么事情",
+    ))
+
+
+def asks_strategy_or_external_cause(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    strategy = any(token in lowered for token in (
+        "做了什么策略", "用了什么策略", "什么策略", "策略吗", "策略是什么",
+    ))
+    causal_spend = (
+        any(token in lowered for token in ("为什么", "原因", "怎么回事"))
+        and any(token in lowered for token in (
+            "费用", "媒体花费", "媒体投资", "投放", "bet", "ait", "费比",
+        ))
+    )
+    correction = any(token in lowered for token in (
+        "为什么会这样", "没回答对", "回答不对",
+    ))
+    return strategy or causal_spend or correction
 
 
 def _enforce_explicit_metrics(plan: FollowupPlan, text: str) -> FollowupPlan:
@@ -100,20 +135,21 @@ def _enforce_explicit_metrics(plan: FollowupPlan, text: str) -> FollowupPlan:
 
 def _context_payload(state: SessionState) -> dict:
     ec_cache = state.ec_context.report_cache or state.last_result_cache or {}
+    evidence = evidence_from_cache(
+        ec_cache, brand=state.ec_context.brand, period=state.ec_context.period,
+        platform=state.ec_context.platform,
+    )
     categories = [
-        row.get("category_cn")
-        for row in ((ec_cache.get("category_result") or {}).get("categories") or [])
-        if row.get("category_cn")
+        row.get("category_cn") or row.get("category")
+        for row in (evidence.get("categories") or [])
+        if row.get("category_cn") or row.get("category")
     ][:20]
-    drivers = [
-        row.get("key_driver")
-        for row in (((ec_cache.get("driver_result") or {}).get("driver_summary") or {}).get("drivers") or [])
-        if row.get("key_driver")
-    ][:20]
+    drivers = [row.get("key_driver") for row in (evidence.get("key_drivers") or []) if row.get("key_driver")][:20]
     return {
         "ec": {
             "brand": state.ec_context.brand or state.drilldown_ctx.brand,
             "period": state.ec_context.period or state.drilldown_ctx.period,
+            "platform": state.ec_context.platform or state.task_context.platform,
             "filters": state.ec_context.filters,
             "available_categories": categories,
             "available_key_drivers": drivers,
@@ -138,17 +174,37 @@ def _skill_guidance() -> str:
 
 def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | None) -> dict:
     lowered = text.casefold()
+    driver_match = detect_key_drivers(text)
     has_bet = (
-        any(token in lowered for token in BET_HINTS)
+        has_explicit_media_intent(text)
+        or any(token in lowered for token in BET_HINTS)
         or _mentions_fee_ratio(text)
         or _mentions_media_spend(text)
     )
-    has_ec = any(token in lowered for token in EC_HINTS)
+    has_ec = any(token in lowered for token in EC_HINTS) or bool(driver_match.drivers)
     domain = "ec_bet" if (has_bet and has_ec) or ("搜索" in text and "生意" in text) else ("bet" if has_bet else "ec")
+    if (
+        not has_bet
+        and not has_ec
+        and asks_strategy_or_external_cause(text)
+        and state.drilldown_ctx.last_analysis_view in {"media_analysis", "bet_followup"}
+    ):
+        domain = "bet"
     ctx = state.bet_context if domain == "bet" else state.ec_context
     resolved_brand = brand or ctx.brand or state.drilldown_ctx.brand or ""
     resolved_period = period or ctx.period or state.drilldown_ctx.period or ""
-    skill = "data_organizer" if is_narrow_followup(text) else "analysis_drill"
+    resolved_platform = (
+        ("DY" if "抖音" in text else "JD" if "京东" in text else "TM" if "天猫" in text else None)
+        or (driver_match.platform if domain == "ec" else None)
+        or (ctx.platform if domain != "bet" else None)
+        or (state.task_context.platform if domain != "bet" else None)
+    )
+    analytical_continuation = any(token in text for token in (
+        "再帮我分析", "再分析", "继续分析", "下钻", "深入分析",
+    ))
+    skill = "analysis_drill" if analytical_continuation else (
+        "data_organizer" if is_narrow_followup(text) else "analysis_drill"
+    )
     if "拖累" in text or "贡献" in text or "来源" in text:
         mode = "change_attribution"
     elif "对比" in text or "比较" in text or "哪个" in text:
@@ -172,7 +228,13 @@ def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | 
         if match:
             filters[label] = match.group(1)
     tiers = re.findall(r"(?<![A-Za-z0-9])(T[1-5]|KOC)(?![A-Za-z0-9])", text, flags=re.I)
-    if domain == "ec" and tiers:
+    if domain == "ec" and driver_match.platform == "TM":
+        filters.pop("tier", None)
+        values = list(driver_match.drivers)
+        filters["key_driver"] = values[0] if len(values) == 1 else values
+        if len(values) > 1 or any(token in text for token in ("分别", "对比", "比较", "哪个", "贡献")):
+            group_by = ["key_driver"]
+    elif domain == "ec" and tiers:
         filters.pop("tier", None)
         filters["key_driver"] = tiers[0].upper()
     elif len(tiers) > 1:
@@ -204,13 +266,24 @@ def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | 
         metrics = ["gmv_actual", "gmv_evol"] if domain == "ec" else ["spend_actual", "spend_evol"]
     if domain == "ec":
         cache = state.ec_context.report_cache or state.last_result_cache or {}
-        categories = ((cache.get("category_result") or {}).get("categories") or [])
+        evidence = evidence_from_cache(
+            cache, brand=resolved_brand, period=resolved_period, platform=resolved_platform,
+        )
+        categories = evidence.get("categories") or []
         for item in categories:
-            candidate = str(item.get("category_cn") or "")
+            candidate = str(item.get("category_cn") or item.get("category") or "")
             short = candidate.split("-")[-1]
             if candidate and (candidate in text or short in text):
                 filters["category"] = candidate
                 break
+        if "category" not in filters and any(token in text for token in ("这个品类", "该品类", "这个类目", "该类目")):
+            inherited_category = (
+                (ctx.filters or {}).get("category")
+                or evidence.get("selected_category")
+                or state.drilldown_ctx.category
+            )
+            if inherited_category:
+                filters["category"] = inherited_category
         if "品类" in text and mode in {"composition", "change_attribution", "ranking"} and "category" not in filters:
             group_by = ["category"]
         if any(token in text.casefold() for token in ("链接", "sku", "top链接")):
@@ -227,6 +300,7 @@ def _rule_plan(text: str, state: SessionState, brand: str | None, period: str | 
             group_by.append("ait")
     return {
         "skill": skill, "domain": domain, "mode": mode, "brand": resolved_brand,
+        "platform": resolved_platform,
         "period": {"raw": resolved_period}, "filters": filters,
         "group_by": group_by, "metrics": metrics, "comparison": "yoy",
         "sort": {"metric": metrics[0] if metrics else "", "direction": "desc"},
@@ -246,14 +320,16 @@ def _llm_plan(text: str, state: SessionState, brand: str | None, period: str | N
 必须遵守以下Skill业务方法：
 {_skill_guidance()}
 
-只返回JSON，字段严格为：skill,domain,mode,brand,period,filters,group_by,metrics,comparison,sort,limit。
+只返回JSON，字段严格为：skill,domain,mode,brand,period,platform,filters,group_by,metrics,comparison,sort,limit。
 skill只能analysis_drill或data_organizer；domain只能ec/bet/ec_bet。
+platform只能从当前上下文的TM/DY/JD/TTL中选择，不得猜测；没有就返回空字符串。
 分析mode：performance/composition/change_attribution/comparison/trend_alignment；
 整理mode：period_summary/monthly_trend/cross_table/ranking。
 group_by只能month/category/key_driver/series/sku/ait/platform/bkfst/kol_platform/tier/kol_type/kol。
 filters只能category/key_driver/series/function_tag/platform/ait/bkfst/tier/kol_type。
 metrics只能gmv_actual/gmv_evol/unit_actual/unit_evol/atv_actual/spend_actual/spend_evol/spend_weight/spend_weight_change/nso_actual/nso_evol/fee_ratio/fee_ratio_change/search_actual/search_evol/cost_actual/cost_evol/cost_weight/cost_weight_change/engage_actual/engage_evol/cpe。
 媒体费比、Take Rate、TR和BET%是同一个KPI，统一使用fee_ratio/fee_ratio_change。数字追问中单独的BET或AIT都指媒体花费，必须使用spend_actual/spend_evol，不得解释为其他指标。用户同时点名媒体花费和费比时，metrics必须同时包含spend_actual、spend_evol、fee_ratio、fee_ratio_change，不得省略任何一个。
+业务知识强约束：“李佳琦”、“T2”、“Non-KOL”是天猫电商Key Driver；“KOL直播”、“品牌自营直播”、“短视频”是抖音电商Key Driver。这些词单独出现都是EC生意，不是BET/媒体；只有用户另外明确说BET、媒体投资、媒体花费或投放时才可加入BET。Non-KOL字样中的KOL不得触发媒体意图。
 不要补造品牌或时间；缺失就空字符串。用户说按月/整理/列出/表格/趋势/排名/对比时优先data_organizer，EC与BET同月对照用analysis_drill+ec_bet+trend_alignment。
 """
     try:
@@ -284,11 +360,15 @@ def _resolve_ec_category(value, state: SessionState):
     if not value or isinstance(value, list):
         return value
     cache = state.ec_context.report_cache or state.last_result_cache or {}
-    categories = ((cache.get("category_result") or {}).get("categories") or [])
+    evidence = evidence_from_cache(
+        cache, brand=state.ec_context.brand, period=state.ec_context.period,
+        platform=state.ec_context.platform,
+    )
+    categories = evidence.get("categories") or []
     requested = _normalize_name(str(value))
     matches = []
     for item in categories:
-        full = str(item.get("category_cn") or "")
+        full = str(item.get("category_cn") or item.get("category") or "")
         short = full.split("-")[-1]
         candidates = {_normalize_name(full), _normalize_name(short)}
         if requested in candidates or any(requested and requested in candidate for candidate in candidates):
@@ -321,7 +401,7 @@ def validate_plan(raw: dict, state: SessionState, *, brand: str | None = None, p
     if domain not in contract["domains"] or mode not in contract["modes"]:
         raise ValueError("追问模式与Skill契约不匹配。")
     ctx = state.bet_context if domain == "bet" else state.ec_context
-    resolved_brand = str(raw.get("brand") or brand or ctx.brand or state.drilldown_ctx.brand or "").strip()
+    resolved_brand = str(brand or raw.get("brand") or ctx.brand or state.drilldown_ctx.brand or "").strip()
     raw_period = raw.get("period") or {}
     if isinstance(raw_period, dict):
         period_value = raw_period.get("raw")
@@ -329,11 +409,18 @@ def validate_plan(raw: dict, state: SessionState, *, brand: str | None = None, p
             period_value = f"{raw_period['start']}~{raw_period['end']}"
     else:
         period_value = raw_period
-    period_text = str(period_value or period or ctx.period or state.drilldown_ctx.period or "").strip()
+    period_text = str(period or period_value or ctx.period or state.drilldown_ctx.period or "").strip()
     if not resolved_brand:
         raise ValueError("missing_brand")
     if not period_text:
         raise ValueError("missing_period")
+    explicit_platform = str(raw.get("platform") or "").upper()
+    resolved_platform = (
+        explicit_platform if explicit_platform in {"TM", "DY", "JD", "TTL"}
+        else (ctx.platform or state.task_context.platform if domain != "bet" else None)
+    )
+    if domain == "ec" and not resolved_platform:
+        raise ValueError("missing_platform")
     allowed_filters = {"category", "key_driver", "series", "function_tag", "platform", "ait", "bkfst", "tier", "kol_type"}
     filters = {k: v for k, v in dict(raw.get("filters") or {}).items() if k in allowed_filters and v not in (None, "")}
     if domain == "ec" and filters.get("category"):
@@ -390,10 +477,28 @@ def validate_plan(raw: dict, state: SessionState, *, brand: str | None = None, p
             period_object = {"raw": period_text, "start": parsed_period["current_start"], "end": parsed_period["current_end"]}
     except ValueError:
         period_object = {"raw": period_text, "start": "", "end": ""}
-    return FollowupPlan(skill, domain, mode, resolved_brand, period_object, filters, group_by, metrics, str(raw.get("comparison") or "yoy"), sort, limit)
+    return FollowupPlan(
+        skill=skill, domain=domain, mode=mode, brand=resolved_brand,
+        period=period_object, platform=resolved_platform, filters=filters,
+        group_by=group_by, metrics=metrics,
+        comparison=str(raw.get("comparison") or "yoy"), sort=sort, limit=limit,
+    )
 
 
 def build_followup_plan(text: str, state: SessionState, *, brand: str | None = None, period: str | None = None) -> FollowupPlan:
+    # Business-owned Key Driver semantics override an LLM's domain guess. This
+    # prevents the substring "KOL" in Non-KOL/KOL直播 from sourcing BET data.
+    driver_match = detect_key_drivers(text)
+    if driver_match.drivers and not has_explicit_media_intent(text):
+        rule_raw = _rule_plan(text, state, brand, period)
+        return _enforce_explicit_metrics(
+            validate_plan(rule_raw, state, brand=brand, period=period), text
+        )
+    if asks_strategy_or_external_cause(text):
+        rule_raw = _rule_plan(text, state, brand, period)
+        return _enforce_explicit_metrics(
+            validate_plan(rule_raw, state, brand=brand, period=period), text
+        )
     llm_raw = _llm_plan(text, state, brand, period)
     if llm_raw:
         try:

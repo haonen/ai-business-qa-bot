@@ -19,6 +19,24 @@ EC_PAIRS = {
 }
 
 
+def _normalized_text(value: object) -> str:
+    return re.sub(r"[\s\-_'`’·.&]+", "", str(value or "")).casefold()
+
+
+def _series_matches(title: object, brand: str, requested: list[object]) -> bool:
+    wanted = {_normalized_text(value) for value in requested if _normalized_text(value)}
+    if not wanted:
+        return True
+    raw_title = str(title or "")
+    inferred, _, source = _infer_series_from_title(raw_title, brand)
+    if source != "fallback" and _normalized_text(inferred) in wanted:
+        return True
+    # Fallback matching happens only after the indexed brand/date query has
+    # aggregated rows by SKU.  It never becomes a leading-wildcard DB scan.
+    normalized_title = _normalized_text(raw_title)
+    return any(value in normalized_title for value in wanted)
+
+
 def _validate(group_by: list[str], filters: dict):
     if len(group_by) > 2 or any(item not in EC_DIMENSIONS for item in group_by):
         raise ValueError("不支持的EC维度组合。")
@@ -51,7 +69,6 @@ def _raw_rows(context: dict, filters: dict) -> pd.DataFrame:
           )
           AND (:category IS NULL OR category_CN = :category)
           AND (:key_driver IS NULL OR key_driver = :key_driver)
-          AND (:series IS NULL OR product_title LIKE CONCAT('%', :series, '%'))
         GROUP BY period_key, source_month, category_CN, key_driver, item_id
     """
     params = {
@@ -59,7 +76,6 @@ def _raw_rows(context: dict, filters: dict) -> pd.DataFrame:
         **{k: context[k] for k in ("current_start", "current_end", "prior_start", "prior_end")},
         "category": None if isinstance(filters.get("category"), list) else filters.get("category"),
         "key_driver": None if isinstance(filters.get("key_driver"), list) else filters.get("key_driver"),
-        "series": None if isinstance(filters.get("series"), list) else filters.get("series"),
     }
     df = fetch_df(sql, params)
     if df.empty:
@@ -68,9 +84,10 @@ def _raw_rows(context: dict, filters: dict) -> pd.DataFrame:
         if isinstance(filters.get(column), list):
             wanted = {str(value).casefold() for value in filters[column]}
             df = df[df[column].fillna("").astype(str).str.casefold().isin(wanted)]
-    if isinstance(filters.get("series"), list):
-        wanted = [str(value).casefold() for value in filters["series"]]
-        df = df[df["product_title"].fillna("").astype(str).str.casefold().map(lambda title: any(value in title for value in wanted))]
+    if filters.get("series"):
+        requested = filters["series"] if isinstance(filters["series"], list) else [filters["series"]]
+        brand = context.get("input_brand") or context.get("source_brand") or ""
+        df = df[df["product_title"].map(lambda title: _series_matches(title, brand, requested))]
     if filters.get("function_tag"):
         words = load_function_tags().get(filters["function_tag"], [])
         if words:

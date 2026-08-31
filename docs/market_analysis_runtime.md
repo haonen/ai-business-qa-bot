@@ -7,7 +7,7 @@
 - `market_brand_deep_dive`：同时要求跨三平台、选品、生意节奏、价格/促销或学习点的Top品牌深度分析。该路由不能降级为单张品牌榜。
 - 未写时间时追问；Segment默认`PURE MASS`。大盘趋势平台默认`TTL`（TM＋DY＋JD）。
 - `Total Beauty Market`是Segment加总口径：月表和日表都直接使用`global_segment='Beauty Market'`，不得用`category_EN='Total Beauty'`代替。
-- `Pure Mass`/`Selective`/`Professional`的完整月仍使用各自`global_segment`下的`category_EN='Total Beauty'`品类总计；日表汇总所选Segment下的全部生意。
+- `Pure Mass`/`Selective`/`Professional`的完整月按用户指定的业务Category查询；非完整月的非TTL Category在日表口径确认前明确提示不支持。
 - 品牌表`three_platform_store_rank_monthly`和`tmall_store_ranking_day_jiashicang`中，`SELECTIVITY IS NULL`已确认为Pure Mass权威口径。
 - Top品牌平台默认`TM`，即天猫Pure Mass Top 5；品牌榜月/日表中Pure Mass的数据口径为`SELECTIVITY IS NULL`。用户明确指定三平台、抖音、京东或其他Segment时才切换口径。
 
@@ -19,7 +19,17 @@
 | `query_market_top_brands` | `three_platform_store_rank_monthly` | `tmall_store_ranking_day_jiashicang` |
 | `query_market_brand_deep_dive` | 品牌榜月表＋`ai_bot_tmall_product_link`＋`ai_bot_dy_product_link` | 当前至少按月输出节奏；京东商品级数据源待补 |
 
-品牌/月度市场表`three_platform_store_rank_monthly.bus_date`按`YYYY-01-MM`存储，必须把日字段恢复为业务月份`YYYY-MM-01`后再筛选；日表日期才按正常自然日期解析。不得对月表直接`CAST(bus_date AS DATE)`，否则4—6月会被误读为1月4—6日。
+品牌月表`three_platform_store_rank_monthly.bus_date`和大盘月表`three_platforms_segmented_markets_monthly.bus_date`都是正常自然日期，按`CAST(bus_date AS DATE)`/`YEAR(bus_date)`/`MONTH(bus_date)`读取业务月份，不得用`DAY(bus_date)`代表月份。
+
+三平台统一Category口径：
+
+- `TOTAL BEAUTY`：`category_EN_level_1`为Skincare、Makeup或Hair；Fragrance单类不计入。
+- `FEMALE SKINCARE`：level 1为Skincare，且level 2不等于`male skincare`。
+- `MALE SKINCARE`：level 1为Skincare，且level 2等于`male skincare`。
+- `MAKEUP`：level 1为Makeup相关值，包括`Makeup (exclude Fragrance)`与`Makeup + Fragrance`。
+- `HAIR`：level 1为Hair。
+
+禁止用`clear_category_status='TTL'`代替上述组合。
 
 完整自然月且月表有完整口径时使用月表，否则使用日表；本期和同期逐月独立选择，同一个月份只使用一个来源。
 

@@ -110,6 +110,11 @@ def _platform_and_month_analysis(coverage: list[dict], brands: list[str]) -> dic
     return output
 
 
+def build_brand_platform_matrix(coverage: list[dict], brands: list[str]) -> dict[str, dict]:
+    """Public, SQL-free adapter used by the executable Plan capability."""
+    return _platform_and_month_analysis(coverage, brands)
+
+
 def _event_labels(period_meta: dict) -> list[str]:
     start = pd.Timestamp(period_meta["current_start"])
     end = pd.Timestamp(period_meta["current_end"])
@@ -222,12 +227,14 @@ def query_market_brand_deep_dive(
     brand_limit: int = 3,
     platform: str = "TTL",
     ranking_metric: str = "gmv_growth",
+    category: str = "TOTAL BEAUTY",
 ) -> dict:
     """Select representative Mass brands and analyze platforms, rhythm and products."""
     try:
         ranking = query_market_top_brands(
             period=period, segment=segment, platform=platform,
-            ranking_metric=ranking_metric, limit=max(brand_limit, 20)
+            ranking_metric=ranking_metric, limit=max(brand_limit, 20),
+            category=category,
         )
         if ranking.get("error"):
             return ranking
@@ -260,7 +267,7 @@ def query_market_brand_deep_dive(
                 "segment": segment,
                 "platform": platform,
                 "ranking_metric": ranking_metric,
-                "category": "Total Beauty",
+                "category": category,
                 "current_period": [parsed["current_start"], parsed["current_end"]],
                 "prior_period": [parsed["prior_start"], parsed["prior_end"]],
             },

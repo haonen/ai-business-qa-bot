@@ -35,7 +35,7 @@ def run_douyin_business_chain(
             },
         }
     if on_progress:
-        on_progress("已完成类目下钻，正在整理渠道、产品系列和Top 5链接…")
+        on_progress("已完成品牌及类目汇总，正在整理品牌级渠道表现…")
     markdown = format_douyin_business_report(result)
     return {
         "ok": True,

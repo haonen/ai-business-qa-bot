@@ -5,6 +5,7 @@ from datetime import date
 import pandas as pd
 
 from bot.db.connection import fetch_df
+from bot.platforms import platform_filter_sql
 from bot.tools.common import tool
 from bot.utils import safe_evol
 
@@ -29,7 +30,7 @@ def query_ec_nso(
         prior_start_year, prior_start_month = _year_month(prior_start)
         prior_end_year, prior_end_month = _year_month(prior_end)
         df = fetch_df(
-            """
+            f"""
             SELECT
                 'current' AS period_type,
                 year,
@@ -38,7 +39,7 @@ def query_ec_nso(
                 COUNT(*) AS row_count
             FROM top_brands_total_ec
             WHERE Brand = :brand
-              AND platform = 'TTL'
+              AND {platform_filter_sql('top_brands_total_ec', 'TTL')}
               AND (
                     year > :focus_start_year
                     OR (year = :focus_start_year AND month >= :focus_start_month)
@@ -59,7 +60,7 @@ def query_ec_nso(
                 COUNT(*) AS row_count
             FROM top_brands_total_ec
             WHERE Brand = :brand
-              AND platform = 'TTL'
+              AND {platform_filter_sql('top_brands_total_ec', 'TTL')}
               AND (
                     year > :prior_start_year
                     OR (year = :prior_start_year AND month >= :prior_start_month)
