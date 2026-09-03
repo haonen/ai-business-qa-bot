@@ -57,6 +57,8 @@ def run_default_chain(
             "meta": {
                 "brand": brand,
                 "period": period,
+                "error_code": category_result.get("error"),
+                "latest_date": category_result.get("latest_date"),
                 "document_ready": False,
             },
         }

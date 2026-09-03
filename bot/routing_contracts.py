@@ -28,7 +28,7 @@ def infer_response_strategy(
         return "CLARIFY"
     if route in {
         "market_brand_deep_dive", "brand_platform_deep_dive",
-        "brand_business_investment_analysis",
+        "brand_business_investment_analysis", "multi_period_business_analysis",
     } or "COMPLEX_MARKET_PLAN" in set(reason_codes):
         return "MULTI_STEP_ANALYSIS"
     if route in {"skill_dispatch", "filter_update"}:
@@ -72,6 +72,8 @@ class RouteDecision:
     ranking_metric: str | None = None
     ranking_limit: int | None = None
     comparison: str | None = None
+    comparison_spec: dict = field(default_factory=dict)
+    business_spec: dict = field(default_factory=dict)
     missing_slots: list[str] = field(default_factory=list)
     unsupported_requests: list[str] = field(default_factory=list)
     requires_confirmation: bool = False

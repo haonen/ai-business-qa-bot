@@ -3,14 +3,16 @@ from __future__ import annotations
 import calendar
 from datetime import date
 
+from bot.business_analysis_spec import (
+    BUSINESS_CATEGORIES,
+    normalize_business_category,
+)
 from bot.platforms import canonical_platform
 
 
 MARKET_PLATFORMS = ("TM", "DY", "JD")
 MARKET_SEGMENTS = ("BEAUTY MARKET", "PURE MASS", "SELECTIVE", "PROFESSIONAL")
-MARKET_CATEGORIES = (
-    "TOTAL BEAUTY", "FEMALE SKINCARE", "MAKEUP", "HAIR", "MALE SKINCARE",
-)
+MARKET_CATEGORIES = BUSINESS_CATEGORIES
 
 # Confirmed cross-platform business taxonomy.  Skincare at level 1 contains
 # both female and male skincare; female skincare is therefore Skincare less
@@ -40,22 +42,7 @@ def store_rank_monthly_date_sql(column: str = "bus_date") -> str:
 
 
 def normalize_market_category(category: str | None) -> str:
-    value = str(category or "TOTAL BEAUTY").strip().upper()
-    aliases = {
-        "TTL BEAUTY": "TOTAL BEAUTY",
-        "TOTAL BEAUTY": "TOTAL BEAUTY",
-        "SKINCARE": "FEMALE SKINCARE",
-        "FEMALE SKINCARE": "FEMALE SKINCARE",
-        "MAKEUP": "MAKEUP",
-        "HAIR": "HAIR",
-        "HAIRCARE": "HAIR",
-        "MALE SKINCARE": "MALE SKINCARE",
-        "MEX": "MALE SKINCARE",
-    }
-    normalized = aliases.get(value)
-    if normalized not in MARKET_CATEGORIES:
-        raise ValueError("不支持的Category参数。")
-    return normalized
+    return normalize_business_category(category)
 
 
 def store_rank_business_category_sql(

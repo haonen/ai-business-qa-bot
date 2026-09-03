@@ -125,13 +125,14 @@ class RouterV2GoldenSetTests(unittest.TestCase):
         self.assertEqual(result.type, "clarify_ec_platform")
         self.assertIsNone(result.platform)
 
-    def test_naked_market_asks_all_missing_scopes(self):
+    def test_naked_market_uses_department_defaults_and_asks_only_open_scopes(self):
         result = self.route("大盘怎么样")
         self.assertEqual(result.type, "clarify_market_scope")
         self.assertEqual(
             set(result.route_decision["missing_slots"]),
-            {"period", "commerce_scope.platforms", "market_scope.segment", "market_scope.category"},
+            {"period", "commerce_scope.platforms"},
         )
+        self.assertEqual((result.segment, result.category), ("PURE MASS", "TOTAL BEAUTY"))
 
     def test_market_complete_total_beauty_routes(self):
         result = self.route("2026年Q1天猫Pure Mass TTL Beauty大盘Top 3品牌")
@@ -240,14 +241,15 @@ class RouterV2GoldenSetTests(unittest.TestCase):
             "然后选择他们增长最多的平台再往下分析。最后看他们今年到目前为止最新的BET。"
         )
         result = self.route(text)
-        self.assertEqual(result.type, "clarify_market_scope")
+        self.assertEqual(result.type, "clarify_analysis_scope")
         self.assert_intents(result, ["MARKET", "BET"])
         self.assertTrue(result.include_bet)
         self.assertTrue(result.bet_latest_ytd)
         self.assertEqual(result.ranking_limit, 3)
-        self.assertIn("已保留完整任务", result.message)
+        self.assertIn("执行计划", result.message)
         self.assertIn("最新可用月", result.message)
-        self.assertEqual(result.route_decision["missing_slots"], ["market_scope.category"])
+        self.assertEqual(result.route_decision["missing_slots"], [])
+        self.assertEqual(result.category, "TOTAL BEAUTY")
 
     def test_market_scope_reply_does_not_collapse_composite_plan(self):
         original = "2026年6月Pure Mass Top3三平台下钻，最后看今年最新BET"

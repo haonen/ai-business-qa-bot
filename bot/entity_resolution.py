@@ -560,7 +560,10 @@ def resolve_time_scope(
             mention.role = "FOCUS" if index == 0 else "UNRESOLVED"
         for index in range(len(role_mentions) - 1):
             between = text[role_mentions[index].end_offset:role_mentions[index + 1].start_offset].casefold()
-            if re.search(r"同比|对比|比较|\bvs\b|去年同期", between):
+            if (
+                re.search(r"同比|对比|比较|(?<![A-Za-z0-9_])vs(?![A-Za-z0-9_])|去年同期", between)
+                or re.fullmatch(r"\s*(?:环比|比)\s*", between)
+            ):
                 role_mentions[index].role = "FOCUS"
                 role_mentions[index + 1].role = "COMPARISON"
     comparison_mentions = [item for item in role_mentions if item.role == "COMPARISON"]
@@ -595,6 +598,107 @@ def resolve_time_scope(
         campaign_name=(campaign.raw_text if campaign else None),
         missing_slots=list(dict.fromkeys(missing)), status=status,
     )
+
+
+def _comparison_period_payload(mention: TimeMention) -> dict:
+    return {
+        "label": mention.canonical or mention.raw_text,
+        "start_date": mention.start_date,
+        "end_date": mention.end_date,
+    }
+
+
+def _prior_year_period_payload(mention: TimeMention) -> dict:
+    start = _prior_year(date.fromisoformat(str(mention.start_date)))
+    end = _prior_year(date.fromisoformat(str(mention.end_date)))
+    return {
+        "label": f"{start.isoformat()}~{end.isoformat()}",
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+    }
+
+
+def _is_aligned_prior_year(focus: TimeMention, baseline: TimeMention) -> bool:
+    if not all((focus.start_date, focus.end_date, baseline.start_date, baseline.end_date)):
+        return False
+    focus_start, focus_end = date.fromisoformat(focus.start_date), date.fromisoformat(focus.end_date)
+    baseline_start, baseline_end = date.fromisoformat(baseline.start_date), date.fromisoformat(baseline.end_date)
+    return _prior_year(focus_start) == baseline_start and _prior_year(focus_end) == baseline_end
+
+
+def build_comparison_spec(scope: TimeScope, text: str = "") -> dict:
+    """Compile extracted time mentions into a business comparison contract."""
+    mentions = [
+        item for item in scope.mentions
+        if item.role != "CAMPAIGN_LABEL"
+        and item.resolution_status == "exact"
+        and item.start_date and item.end_date
+    ]
+    if not mentions:
+        return {}
+    lowered = str(text or "").casefold()
+    focus_mentions = [item for item in mentions if item.role == "FOCUS"]
+    comparison_mentions = [item for item in mentions if item.role == "COMPARISON"]
+
+    if "环比" in lowered and len(mentions) >= 2:
+        return {
+            "mode": "MOM",
+            "analysis_periods": [_comparison_period_payload(mentions[0])],
+            "baseline_periods": [_comparison_period_payload(mentions[1])],
+            "comparison_target": "ACTUAL",
+            "source": "explicit",
+        }
+    direct_actual = bool(re.search(
+        r"绝对值|哪个.{0,4}(?:高|大|多)|(?:多|少)多少|(?:gmv|销售额).{0,6}(?:高|大|多)",
+        lowered, re.I,
+    ))
+    if direct_actual and len(mentions) >= 2:
+        focus = focus_mentions[0] if focus_mentions else mentions[0]
+        baseline = comparison_mentions[0] if comparison_mentions else mentions[1]
+        return {
+            "mode": "DIRECT_ACTUAL",
+            "analysis_periods": [_comparison_period_payload(focus)],
+            "baseline_periods": [_comparison_period_payload(baseline)],
+            "comparison_target": "ACTUAL",
+            "source": "explicit",
+        }
+    if len(mentions) == 2 and _is_aligned_prior_year(mentions[0], mentions[1]):
+        return {
+            "mode": "YOY_ALIGNED",
+            "analysis_periods": [_comparison_period_payload(mentions[0])],
+            "baseline_periods": [_comparison_period_payload(mentions[1])],
+            "comparison_target": "EVOLUTION",
+            "source": "inferred_aligned_pair",
+        }
+    if comparison_mentions:
+        focus = focus_mentions[0] if focus_mentions else mentions[0]
+        baseline = comparison_mentions[0]
+        if (
+            focus.start_date and baseline.start_date
+            and focus.start_date[:4] == baseline.start_date[:4]
+        ):
+            return {
+                "mode": "YOY_ALIGNED",
+                "analysis_periods": [_comparison_period_payload(item) for item in mentions],
+                "baseline_periods": [_prior_year_period_payload(item) for item in mentions],
+                "comparison_target": "EVOLUTION",
+                "source": "business_default",
+            }
+        aligned = _is_aligned_prior_year(focus, baseline)
+        return {
+            "mode": "YOY_ALIGNED" if aligned else "EXPLICIT_BASELINE",
+            "analysis_periods": [_comparison_period_payload(focus)],
+            "baseline_periods": [_comparison_period_payload(baseline)],
+            "comparison_target": "EVOLUTION" if aligned else "ACTUAL",
+            "source": "explicit",
+        }
+    return {
+        "mode": "YOY_ALIGNED",
+        "analysis_periods": [_comparison_period_payload(item) for item in mentions],
+        "baseline_periods": [_prior_year_period_payload(item) for item in mentions],
+        "comparison_target": "EVOLUTION",
+        "source": "business_default" if len(mentions) > 1 else "implicit_yoy",
+    }
 
 
 @lru_cache(maxsize=1)

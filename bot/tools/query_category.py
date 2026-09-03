@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from bot.tools.common import combine_periods, filter_sku, split_periods, tool
+from bot.tools.common import EcDataError, combine_periods, filter_sku, split_periods, tool
 
 
 @tool
@@ -41,5 +41,7 @@ def query_category(
             "total": total,
             "categories": rows,
         }
+    except EcDataError as exc:
+        return {"error": exc.code, "message": str(exc), **exc.details}
     except Exception as exc:
         return {"error": "execution_error", "message": str(exc)}

@@ -10,31 +10,10 @@ from bot.session import add_message, get_session
 from bot.request_audit import record_outcome
 from bot.agent_plan import completion_status
 from bot.inline_answer import build_inline_answer, document_status
+from bot.report_delivery import document_title, should_generate_document
 
 
 log = logging.getLogger(__name__)
-
-
-def _document_title(route_type: str | None, report_meta: dict, market_document: bool) -> str:
-    brand = report_meta.get("brand")
-    period = report_meta.get("period")
-    if market_document:
-        return report_meta.get("document_title") or f"{period} 大盘分析"
-    if route_type == "skill_dispatch":
-        return report_meta.get("document_title") or f"{brand} {period} 数据分析"
-    if route_type == "brand_business_investment_analysis":
-        return report_meta.get("document_title") or f"{brand} {period} 生意与BET投资联合分析"
-    if route_type == "media_analysis":
-        return f"{brand} {report_meta.get('period_display') or period} BET媒体投资分析报告"
-    if route_type == "douyin_business_analysis":
-        return f"{brand} {period} 抖音生意分析报告"
-    if route_type == "jd_business_analysis":
-        return f"{brand} {period} 京东品牌生意分析"
-    if route_type == "three_platform_competitor_analysis":
-        return report_meta.get("document_title") or f"{brand} {period} 三平台生意分析"
-    if route_type == "brand_platform_deep_dive":
-        return report_meta.get("document_title") or f"{brand} {period} 三平台比较与动态下钻"
-    return f"{brand} {period} 生意分析报告"
 
 
 def process_request(
@@ -78,14 +57,8 @@ def process_request(
 
     route_type = result.get("route_type")
     report_meta = result.get("meta", {})
-    market_document = route_type in {"market_analysis", "market_brand_ranking", "market_brand_deep_dive"}
-    brand_document = route_type in {
-        "default_chain", "brand_business_investment_analysis", "douyin_business_analysis",
-        "jd_business_analysis", "three_platform_competitor_analysis", "brand_platform_deep_dive",
-        "media_analysis", "skill_dispatch",
-    } and report_meta.get("brand")
-    if (market_document or brand_document) and report_meta.get("document_ready", True):
-        doc_title = _document_title(route_type, report_meta, market_document)
+    if should_generate_document(route_type, report_meta):
+        doc_title = document_title(route_type, report_meta)
         inline_answer = build_inline_answer(user_text, markdown)
         if queue_enabled() and async_documents_enabled():
             update_text(

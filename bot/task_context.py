@@ -13,7 +13,8 @@ import logging
 import os
 from typing import Any
 
-from bot.entity_resolution import resolve_entities
+from bot.business_analysis_spec import build_business_analysis_spec
+from bot.entity_resolution import build_comparison_spec, resolve_entities
 from bot.market_plan import explicit_platform
 from bot.router_v2 import build_route_decision
 from bot.session import BusinessTaskContext, SessionState
@@ -40,6 +41,9 @@ class TaskTurnResolution:
     intents: list[str]
     goals: list[str]
     comparison_metric: str | None = None
+    time_scope: dict = field(default_factory=dict)
+    comparison_spec: dict = field(default_factory=dict)
+    business_spec: dict = field(default_factory=dict)
     media_mode: str | None = None
     media_channels: list[str] = field(default_factory=list)
     original_question: str | None = None
@@ -83,6 +87,9 @@ def _frame_from_state(state: SessionState) -> BusinessTaskContext:
         platform=legacy_platform, intents=intents,
         goals=list(intents), media_mode=pending.get("media_mode"),
         media_channels=list(pending.get("media_channels") or []),
+        time_scope=dict(pending.get("time_scope") or {}),
+        comparison_spec=dict(pending.get("comparison_spec") or {}),
+        business_spec=dict(pending.get("business_spec") or {}),
         awaiting_slot=awaiting, status="awaiting",
     )
 
@@ -146,7 +153,22 @@ def resolve_task_turn(text: str, state: SessionState) -> TaskTurnResolution | No
     # A conflicting explicit brand or period is a new task; let the normal
     # router build a new frame instead of inheriting stale state.
     if explicit_brand and frame.brand and explicit_brand.casefold() != frame.brand.casefold():
-        return None
+        def normalized_names(values) -> set[str]:
+            return {
+                "".join(str(value or "").casefold().split())
+                for value in values if str(value or "").strip()
+            }
+
+        frame_brand = resolve_entities(frame.brand, current_year=date.today().year).brand
+        explicit_names = normalized_names([
+            explicit_brand, entity.brand.canonical_brand_key, *entity.brand.aliases,
+        ])
+        frame_names = normalized_names([
+            frame.brand, *frame.brand_aliases,
+            frame_brand.canonical_brand_key, *frame_brand.aliases,
+        ])
+        if not explicit_names.intersection(frame_names):
+            return None
     if explicit_period and frame.period and explicit_period != frame.period and frame.awaiting_slot != "period":
         return None
 
@@ -205,6 +227,32 @@ def resolve_task_turn(text: str, state: SessionState) -> TaskTurnResolution | No
         missing_slots.append("platform")
     root_question = frame.original_question or text
     combined = root_question if text.strip() == root_question.strip() else f"{root_question}；{text}"
+    resolved_time_scope = (
+        entity.time_scope.to_dict() if explicit_period else dict(frame.time_scope)
+    )
+    resolved_comparison_spec = (
+        build_comparison_spec(entity.time_scope, text)
+        if explicit_period else dict(frame.comparison_spec)
+    )
+    resolved_business_spec = dict(frame.business_spec)
+    if resolved_platform in {"TM", "DY", "JD", "TTL"}:
+        subject_scope = (
+            "market"
+            if "MARKET" in intents or "MARKET_ANALYSIS" in goals
+            else "brand"
+        )
+        resolved_business_spec = build_business_analysis_spec(
+            subject_scope=subject_scope,
+            brand=resolved_brand,
+            platform=resolved_platform,
+            segment=frame.segment,
+            category=frame.category,
+            time_scope=resolved_time_scope,
+            comparison_spec=resolved_comparison_spec,
+            analysis_mode=(
+                current_decision.question_mode if current_decision else "report"
+            ),
+        ).to_dict()
     return TaskTurnResolution(
         relation=relation,
         brand=resolved_brand,
@@ -213,6 +261,8 @@ def resolve_task_turn(text: str, state: SessionState) -> TaskTurnResolution | No
         platform=resolved_platform,
         intents=intents, goals=goals,
         comparison_metric=metric or frame.comparison_metric,
+        time_scope=resolved_time_scope, comparison_spec=resolved_comparison_spec,
+        business_spec=resolved_business_spec,
         media_mode=frame.media_mode, media_channels=list(frame.media_channels),
         original_question=root_question, combined_question=combined,
         missing_slots=missing_slots,

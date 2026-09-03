@@ -87,6 +87,9 @@ class BusinessTaskContext:
     segment: str | None = None
     category: str | None = None
     comparison_metric: str | None = None
+    time_scope: dict = field(default_factory=dict)
+    comparison_spec: dict = field(default_factory=dict)
+    business_spec: dict = field(default_factory=dict)
     awaiting_slot: str | None = None
     status: str = "active"
     last_relation: str | None = None
@@ -140,7 +143,8 @@ class TaskContextPatch:
 _TASK_SLOT_NAMES = {
     "original_question", "brand", "brand_aliases", "period", "platform",
     "dimensions", "media_mode", "media_channels", "segment", "category",
-    "comparison_metric", "awaiting_slot", "status", "last_relation",
+    "comparison_metric", "time_scope", "comparison_spec", "business_spec",
+    "awaiting_slot", "status", "last_relation",
 }
 
 
@@ -161,6 +165,8 @@ def reduce_task_context(current: BusinessTaskContext, patch: TaskContextPatch) -
             value = update.value
             if name in {"brand_aliases", "dimensions", "media_channels"}:
                 value = list(value or [])
+            elif name in {"time_scope", "comparison_spec", "business_spec"}:
+                value = dict(value or {})
             setattr(task, name, value)
     intents = list(patch.set_intents) if patch.set_intents is not None else task.intents
     goals = list(patch.set_goals) if patch.set_goals is not None else task.goals
@@ -378,9 +384,24 @@ def set_pending_request(open_id: str, request: dict | None):
         before = state.task_context
         if request:
             request_brand = str(request.get("brand") or "").strip()
+            normalize_brand = lambda value: "".join(str(value or "").casefold().split())
+            request_brand_names = {
+                normalize_brand(value)
+                for value in [request_brand, *(request.get("brand_aliases") or [])]
+                if str(value or "").strip()
+            }
+            active_brand_names = {
+                normalize_brand(value)
+                for value in [before.brand, *before.brand_aliases]
+                if str(value or "").strip()
+            }
+            brand_conflict = bool(
+                request_brand and before.brand
+                and not request_brand_names.intersection(active_brand_names)
+            )
             relation = (
                 "NEW_TASK"
-                if request_brand and before.brand and request_brand.casefold() != before.brand.casefold()
+                if brand_conflict
                 else "SUPPLY_MISSING_SLOT"
             )
             awaiting = {
@@ -391,6 +412,7 @@ def set_pending_request(open_id: str, request: dict | None):
                 ),
                 "v2_period": "period", "default_analysis": "period",
                 "douyin_business_analysis": "period", "jd_business_analysis": "period",
+                "v2_time_roles": "time_roles",
                 "v2_media_scope": "media_scope", "v2_market_scope": "market_scope",
                 "analysis_preflight": "confirmation",
             }.get(str(request.get("intent") or ""))
@@ -401,7 +423,7 @@ def set_pending_request(open_id: str, request: dict | None):
             for key in (
                 "original_question", "brand", "brand_aliases", "period", "platform",
                 "media_mode", "media_channels", "segment", "category", "dimensions",
-                "comparison_metric",
+                "comparison_metric", "time_scope", "comparison_spec", "business_spec",
             ):
                 source_key = "original_text" if key == "original_question" else key
                 if source_key in request and request.get(source_key) is not None:
@@ -439,6 +461,7 @@ def _log_task_transition(before: BusinessTaskContext, after: BusinessTaskContext
     fields = (
         "brand", "period", "platform", "intents", "goals", "media_mode",
         "media_channels", "segment", "category", "comparison_metric",
+        "time_scope", "comparison_spec", "business_spec",
         "awaiting_slot", "status",
     )
     log.info("[task_context_trace] %s", json.dumps({

@@ -5,10 +5,15 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
-from bot.entity_resolution import ResolvedPeriod, resolve_entities, resolve_time_scope
+from bot.entity_resolution import (
+    ResolvedPeriod,
+    build_comparison_spec,
+    resolve_entities,
+    resolve_time_scope,
+)
 from bot.media_period import parse_media_period
 from bot.router import route
-from bot.session import SessionState
+from bot.session import BusinessTaskContext, SessionState
 from bot.utils import parse_ec_period
 
 
@@ -138,6 +143,37 @@ class EntityResolutionGoldenSetTest(unittest.TestCase):
         result = resolve_time_scope("2026Q1 2026Q2", current_year=2026)
         self.assertIn("time_scope.period_roles", result.missing_slots)
 
+    def test_two_observation_months_default_to_yoy_vs_yoy(self):
+        scope = resolve_time_scope("比较2026年3月和2026年4月", current_year=2026)
+        spec = build_comparison_spec(scope, "比较2026年3月和2026年4月")
+        self.assertEqual(spec["mode"], "YOY_ALIGNED")
+        self.assertEqual(
+            [item["start_date"] for item in spec["analysis_periods"]],
+            ["2026-03-01", "2026-04-01"],
+        )
+        self.assertEqual(
+            [item["start_date"] for item in spec["baseline_periods"]],
+            ["2025-03-01", "2025-04-01"],
+        )
+        self.assertEqual(spec["comparison_target"], "EVOLUTION")
+
+    def test_explicit_month_on_month_uses_direct_sequential_baseline(self):
+        scope = resolve_time_scope("2026年4月环比2026年3月", current_year=2026)
+        spec = build_comparison_spec(scope, "2026年4月环比2026年3月")
+        self.assertNotIn("time_scope.period_roles", scope.missing_slots)
+        self.assertEqual(spec["mode"], "MOM")
+        self.assertEqual(spec["analysis_periods"][0]["start_date"], "2026-04-01")
+        self.assertEqual(spec["baseline_periods"][0]["start_date"], "2026-03-01")
+        self.assertEqual(spec["comparison_target"], "ACTUAL")
+
+    def test_explicit_actual_difference_is_not_treated_as_yoy(self):
+        text = "2026年4月比2026年3月GMV多多少"
+        scope = resolve_time_scope(text, current_year=2026)
+        spec = build_comparison_spec(scope, text)
+        self.assertNotIn("time_scope.period_roles", scope.missing_slots)
+        self.assertEqual(spec["mode"], "DIRECT_ACTUAL")
+        self.assertEqual(spec["comparison_target"], "ACTUAL")
+
     def test_same_brand_chinese_and_english_collapses(self):
         result = resolve_entities("珀莱雅PROYA 2026年Q1生意", current_year=2026)
         self.assertEqual(result.brand.status, "resolved")
@@ -229,6 +265,199 @@ class EntityRouterIntegrationTest(unittest.TestCase):
     def test_campaign_routes_to_window_request(self):
         result = self.routed("谷雨618怎么样")
         self.assertEqual(result.type, "provide_campaign_window")
+
+    def test_aligned_year_pair_does_not_require_time_role_clarification(self):
+        result = self.routed("欧莱雅旗舰店天猫2026年7月和2025年7月的生意")
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(result.comparison_spec["mode"], "YOY_ALIGNED")
+        self.assertEqual(result.comparison_spec["source"], "inferred_aligned_pair")
+
+    def test_ascii_vs_adjacent_to_chinese_assigns_explicit_time_roles(self):
+        result = self.routed(
+            "欧莱雅旗舰店 天猫 2026年7月的生意vs 2025年7月的生意 你有什么发现 请分析"
+        )
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(str(result.period), "2026年7月")
+        self.assertEqual(result.period.comparison_start, "2025-07-01")
+        self.assertEqual(result.comparison_spec["mode"], "YOY_ALIGNED")
+
+    def test_two_douyin_observation_months_route_to_yoy_comparison_execution(self):
+        result = self.routed("你能分析一下珀莱雅5月和6月在抖音的生意吗")
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual((result.brand, result.platform), ("珀莱雅", "DY"))
+        self.assertEqual(result.comparison_spec["mode"], "YOY_ALIGNED")
+        self.assertEqual(
+            [item["start_date"] for item in result.comparison_spec["analysis_periods"]],
+            ["2026-05-01", "2026-06-01"],
+        )
+        self.assertIn("MULTI_OBSERVATION_YOY_PLAN", result.route_decision["reason_codes"])
+
+    def test_multi_observation_time_plan_is_independent_of_business_dimensions(self):
+        cases = [
+            ("分析珀莱雅2026年5月和6月在天猫的生意", "TM", "珀莱雅", None),
+            ("分析珀莱雅2026年5月和6月在抖音的生意", "DY", "珀莱雅", None),
+            ("分析珀莱雅2026年5月和6月在京东的生意", "JD", "珀莱雅", None),
+            ("分析珀莱雅2026年5月和6月三平台的生意", "TTL", "珀莱雅", None),
+            ("分析2026年5月和6月天猫Pure Mass TTL Beauty大盘", "TM", None, "TOTAL BEAUTY"),
+            ("分析2026年5月和6月三平台Pure Mass女士护肤大盘", "TTL", None, "FEMALE SKINCARE"),
+        ]
+        for text, platform, brand, category in cases:
+            with self.subTest(text=text):
+                result = self.routed(text)
+                self.assertEqual(result.type, "multi_period_business_analysis")
+                self.assertEqual(result.platform, platform)
+                self.assertEqual(result.brand, brand)
+                self.assertEqual(result.category, category)
+                self.assertEqual(result.comparison_spec["mode"], "YOY_ALIGNED")
+                self.assertEqual(len(result.comparison_spec["analysis_periods"]), 2)
+                spec = result.business_spec
+                self.assertEqual(spec["subject_scope"], "market" if brand is None else "brand")
+                self.assertEqual(spec["category"], category or "TOTAL BEAUTY")
+                self.assertEqual(
+                    spec["platforms"],
+                    ["TM", "DY", "JD"] if platform == "TTL" else [platform],
+                )
+
+    def test_brand_business_preserves_macro_category_scope(self):
+        result = self.routed("分析珀莱雅2026年5月和6月天猫女士护肤生意")
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual(result.category, "FEMALE SKINCARE")
+
+    def test_production_tmall_month_difference_question_uses_pairwise_yoy_plan(self):
+        result = self.routed("那欧莱雅旗舰店在天猫 3月和5月的生意有什么区别?")
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual((result.brand, result.platform), ("欧莱雅", "TM"))
+        self.assertEqual(
+            [item["start_date"] for item in result.comparison_spec["analysis_periods"]],
+            ["2026-03-01", "2026-05-01"],
+        )
+        self.assertEqual(
+            [item["start_date"] for item in result.comparison_spec["baseline_periods"]],
+            ["2025-03-01", "2025-05-01"],
+        )
+
+    def test_same_year_months_with_vs_still_compare_pairwise_yoy_by_default(self):
+        result = self.routed("比较欧莱雅天猫2026年3月vs2026年5月的生意")
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual(result.comparison_spec["source"], "business_default")
+        self.assertEqual(result.comparison_spec["comparison_target"], "EVOLUTION")
+
+    def test_market_without_segment_keeps_pure_mass_default(self):
+        result = self.routed("分析2026年5月和6月天猫TTL Beauty大盘")
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual(result.segment, "PURE MASS")
+
+    def test_complete_complex_market_plan_does_not_ask_for_empty_scope(self):
+        result = self.routed(
+            "我想知道2026年6月pure mass top3的品牌有谁，先看他们三平台的生意分析，"
+            "然后选择他们增长最多的平台再往下分析。最后看他们今年到目前为止最新的BET。"
+        )
+
+        self.assertEqual(result.type, "clarify_analysis_scope")
+        self.assertEqual(result.segment, "PURE MASS")
+        self.assertEqual(result.category, "TOTAL BEAUTY")
+        self.assertEqual(result.platform, "TTL")
+        self.assertEqual(result.route_decision["missing_slots"], [])
+        self.assertNotIn("开始前还需要你补充：。", result.message or "")
+
+    def test_time_role_reply_uses_active_task_and_ignores_stale_domain_context(self):
+        original = "欧莱雅旗舰店天猫2026年7月和2025年7月的生意"
+        state = SessionState(pending_request={
+            "intent": "v2_time_roles",
+            "original_text": original,
+            "brand": "欧莱雅旗舰店",
+            "brand_aliases": ["欧莱雅旗舰店", "L'OREAL PARIS"],
+            "platform": "TM",
+            "intents": ["EC_BUSINESS"],
+        })
+        state.task_context = BusinessTaskContext(
+            original_question=original,
+            brand="欧莱雅旗舰店",
+            brand_aliases=["欧莱雅旗舰店", "L'OREAL PARIS"],
+            platform="TM",
+            intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            awaiting_slot="time_roles", status="awaiting",
+        )
+        state.ec_context.brand = "珀莱雅"
+        state.ec_context.period = "2026年6月"
+        state.ec_context.platform = "DY"
+        state.ec_context.filters = {"category": "面部护理套装"}
+
+        result = self.routed("分析2026年7月，对比2025年7月", state)
+
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual((result.brand, result.platform), ("欧莱雅旗舰店", "TM"))
+        self.assertEqual(str(result.period), "2026年7月")
+        self.assertEqual(result.period.comparison_start, "2025-07-01")
+        self.assertEqual(result.comparison_spec["mode"], "YOY_ALIGNED")
+        self.assertEqual(result.route_decision["decision_source"], "context_merge")
+
+    def test_complete_new_brand_request_wins_over_pending_time_roles(self):
+        original = "欧莱雅天猫2026年7月和2025年7月的生意"
+        state = SessionState(pending_request={
+            "intent": "v2_time_roles", "original_text": original,
+            "brand": "欧莱雅", "brand_aliases": ["欧莱雅", "L'OREAL PARIS"],
+            "platform": "TM", "intents": ["EC_BUSINESS"],
+        })
+        state.task_context = BusinessTaskContext(
+            original_question=original, brand="欧莱雅",
+            brand_aliases=["欧莱雅", "L'OREAL PARIS"], platform="TM",
+            intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            awaiting_slot="time_roles", status="awaiting",
+        )
+
+        result = self.routed("珀莱雅天猫分析2026年6月，对比2025年6月", state)
+
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(result.brand, "珀莱雅")
+        self.assertEqual(result.route_decision["task_context_patch"]["relation"], "NEW_TASK")
+
+    def test_complete_same_brand_request_wins_over_pending_time_roles(self):
+        original = "欧莱雅天猫2026年7月和2025年7月的生意"
+        state = SessionState(pending_request={
+            "intent": "v2_time_roles", "original_text": original,
+            "brand": "欧莱雅", "brand_aliases": ["欧莱雅", "L'OREAL PARIS"],
+            "platform": "TM", "intents": ["EC_BUSINESS"],
+        })
+        state.task_context = BusinessTaskContext(
+            original_question=original, brand="欧莱雅",
+            brand_aliases=["欧莱雅", "L'OREAL PARIS"], platform="TM",
+            intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            awaiting_slot="time_roles", status="awaiting",
+        )
+
+        result = self.routed("那欧莱雅旗舰店在天猫 3月和5月的生意有什么区别?", state)
+
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual((result.brand, result.platform), ("欧莱雅", "TM"))
+        self.assertEqual(
+            [item["start_date"] for item in result.comparison_spec["analysis_periods"]],
+            ["2026-03-01", "2026-05-01"],
+        )
+        self.assertEqual(
+            [item["start_date"] for item in result.comparison_spec["baseline_periods"]],
+            ["2025-03-01", "2025-05-01"],
+        )
+
+    def test_new_brand_multi_period_request_is_not_captured_by_old_time_clarification(self):
+        original = "欧莱雅天猫2026年3月和5月的生意"
+        state = SessionState(pending_request={
+            "intent": "v2_time_roles", "original_text": original,
+            "brand": "欧莱雅", "brand_aliases": ["欧莱雅", "L'OREAL PARIS"],
+            "platform": "TM", "intents": ["EC_BUSINESS"],
+        })
+        state.task_context = BusinessTaskContext(
+            original_question=original, brand="欧莱雅",
+            brand_aliases=["欧莱雅", "L'OREAL PARIS"], platform="TM",
+            intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            awaiting_slot="time_roles", status="awaiting",
+        )
+
+        result = self.routed("你能分析一下谷雨5月和6月在天猫的生意吗", state)
+
+        self.assertEqual(result.type, "multi_period_business_analysis")
+        self.assertEqual((result.brand, result.platform), ("谷雨", "TM"))
+        self.assertEqual(result.route_decision["task_context_patch"]["relation"], "NEW_TASK")
 
     def test_year_confirmation_is_task_scoped(self):
         state = SessionState(pending_request={

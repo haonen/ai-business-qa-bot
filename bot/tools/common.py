@@ -23,7 +23,10 @@ def tool(fn=None, **_kwargs):
 
 
 class EcDataError(ValueError):
-    pass
+    def __init__(self, message: str, *, code: str = "ec_data_error", **details):
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details)
 
 
 _EC_CONTEXT_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
@@ -72,7 +75,9 @@ def ec_query_context(
     if parsed["current_end"] > max_date:
         raise EcDataError(
             f"当前品牌数据更新至{max_date}，"
-            f"你指定的本期为{parsed['current_start']}至{parsed['current_end']}，请重新指定时间。"
+            f"你指定的本期为{parsed['current_start']}至{parsed['current_end']}，请重新指定时间。",
+            code="period_after_latest_date", latest_date=max_date,
+            requested_start=parsed["current_start"], requested_end=parsed["current_end"],
         )
     current_exists = fetch_one(
         """

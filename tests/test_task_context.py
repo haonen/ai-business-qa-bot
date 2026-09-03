@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from uuid import uuid4
 from unittest.mock import patch
 
 from bot.router import route
@@ -12,7 +13,9 @@ from bot.session import (
     SessionState,
     SlotUpdate,
     TaskContextPatch,
+    get_session,
     reduce_task_context,
+    set_pending_request,
 )
 
 
@@ -63,14 +66,79 @@ class TaskContextReducerTests(unittest.TestCase):
         self.assertEqual(after.intents, ["EC_BUSINESS"])
         self.assertEqual(after.goals, ["EC_BUSINESS"])
 
+    def test_structured_time_contract_survives_slot_merge(self):
+        before = BusinessTaskContext(
+            brand="欧莱雅", awaiting_slot="platform",
+            time_scope={"status": "exact"},
+            comparison_spec={"mode": "YOY_ALIGNED"},
+        )
+        after = reduce_task_context(before, TaskContextPatch(
+            relation="SUPPLY_MISSING_SLOT",
+            slots={"platform": SlotUpdate(SET, "TM")},
+        ))
+        self.assertEqual(after.time_scope, {"status": "exact"})
+        self.assertEqual(after.comparison_spec, {"mode": "YOY_ALIGNED"})
+
+    def test_time_role_pending_request_is_persisted_as_an_awaiting_slot(self):
+        open_id = f"time-role-{uuid4().hex}"
+        with patch.dict(os.environ, {
+            "BOT_QUEUE_ENABLED": "0", "BOT_SESSION_BACKEND": "memory",
+        }, clear=False):
+            set_pending_request(open_id, {
+                "intent": "v2_time_roles",
+                "original_text": "欧莱雅天猫2026年7月和2025年7月的生意",
+                "brand": "欧莱雅", "platform": "TM",
+                "time_scope": {"status": "needs_clarification"},
+            })
+            state = get_session(open_id)
+        self.assertEqual(state.pending_request["intent"], "v2_time_roles")
+        self.assertEqual(state.task_context.awaiting_slot, "time_roles")
+        self.assertEqual(state.task_context.status, "awaiting")
+
 
 class TaskContextRouterTests(unittest.TestCase):
+    def test_revised_period_resumes_failed_tmall_request_without_forgetting_platform(self):
+        state = SessionState()
+        state.pending_request = {
+            "intent": "v2_period",
+            "original_text": "欧莱雅旗舰店 天猫 2026年7月的生意vs 2025年7月的生意",
+            "brand": "欧莱雅", "brand_aliases": ["欧莱雅"], "platform": "TM",
+            "intents": ["EC_BUSINESS"],
+        }
+        state.task_context = BusinessTaskContext(
+            original_question=state.pending_request["original_text"],
+            brand="欧莱雅", brand_aliases=["欧莱雅"], platform="TM",
+            intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            awaiting_slot="period", status="awaiting",
+        )
+        with patch.dict(os.environ, {
+            "TASK_CONTEXT_V2_ENABLED": "1", "TASK_CONTEXT_LLM_ENABLED": "0",
+            "ROUTER_V2_ENABLED": "1", "ENTITY_RESOLVER_V2_ENABLED": "1",
+        }, clear=False):
+            result = route("就用2026年7月1日到7月19日就可以", state)
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual((result.brand, result.platform), ("欧莱雅", "TM"))
+        self.assertEqual(result.period, "2026年7月1日至7月19日")
+        spec = result.comparison_spec
+        self.assertEqual(spec["analysis_periods"][0]["end_date"], "2026-07-19")
+        self.assertEqual(spec["baseline_periods"][0]["end_date"], "2025-07-19")
+        self.assertEqual(result.business_spec["platforms"], ["TM"])
+        self.assertEqual(
+            result.business_spec["comparison_spec"]["analysis_periods"][0]["end_date"],
+            "2026-07-19",
+        )
+
     def test_slot_reply_keeps_brand_period_and_adds_platform(self):
         state = SessionState()
         state.task_context = BusinessTaskContext(
             original_question="分析花知晓2026年4-6月的生意",
             brand="花知晓", period="2026年4-6月",
             intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            business_spec={
+                "subject_scope": "brand", "brand": "花知晓",
+                "platforms": [], "platform_mode": "single",
+                "category": "TOTAL BEAUTY",
+            },
             awaiting_slot="platform", status="awaiting",
         )
         with patch.dict(os.environ, {
@@ -82,6 +150,8 @@ class TaskContextRouterTests(unittest.TestCase):
         self.assertEqual((result.brand, result.period, result.platform), (
             "花知晓", "2026年4-6月", "TTL",
         ))
+        self.assertEqual(result.business_spec["platforms"], ["TM", "DY", "JD"])
+        self.assertEqual(result.business_spec["platform_mode"], "combined")
         trace = result.route_decision["task_context_trace"]
         self.assertEqual(trace["explicit_patch"]["platform"], "TTL")
 
@@ -103,6 +173,23 @@ class TaskContextRouterTests(unittest.TestCase):
         self.assertEqual(
             result.route_decision["task_context_patch"]["relation"], "NEW_TASK",
         )
+
+    def test_brand_alias_does_not_start_a_new_task(self):
+        state = SessionState()
+        state.task_context = BusinessTaskContext(
+            original_question="分析PROYA的生意",
+            brand="PROYA", brand_aliases=["PROYA", "珀莱雅"],
+            period="2026年6月", intents=["EC_BUSINESS"], goals=["EC_BUSINESS"],
+            awaiting_slot="platform", status="awaiting",
+        )
+        with patch.dict(os.environ, {
+            "TASK_CONTEXT_V2_ENABLED": "1", "TASK_CONTEXT_LLM_ENABLED": "0",
+            "ROUTER_V2_ENABLED": "1",
+        }, clear=False):
+            result = route("珀莱雅天猫", state)
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(result.route_decision["decision_source"], "active_task_merge")
+        self.assertEqual((result.period, result.platform), ("2026年6月", "TM"))
 
 
 if __name__ == "__main__":

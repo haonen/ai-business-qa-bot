@@ -21,7 +21,11 @@ from bot.routing_contracts import (
     CommerceScope, MarketScope, MediaScope, RouteDecision,
     infer_response_strategy, validate_route_decision,
 )
-from bot.entity_resolution import EntityResolution, ResolvedPeriod, resolve_entities, resolve_time_scope
+from bot.entity_resolution import (
+    EntityResolution, ResolvedPeriod, build_comparison_spec,
+    resolve_entities, resolve_time_scope,
+)
+from bot.business_analysis_spec import compile_business_analysis_spec
 from bot.key_driver_ontology import (
     detect_key_drivers, has_explicit_media_intent, inferred_key_driver_platform,
 )
@@ -103,6 +107,8 @@ class RouteResult:
     message: str | None = None
     route_decision: dict | None = None
     time_scope: dict | None = None
+    comparison_spec: dict | None = None
+    business_spec: dict | None = None
     brand_resolution: dict | None = None
     task_bindings: list[dict] | None = None
     business_period: ResolvedPeriod | None = None
@@ -217,6 +223,7 @@ def _adapt_v2_decision(decision: RouteDecision) -> RouteResult:
         "clarify_market_scope": "market_scope", "clarify_analysis_scope": "confirmation",
         "provide_campaign_window": "campaign_window",
         "confirm_brand_candidate": "brand_candidate",
+        "clarify_time_roles": "time_roles",
     }.get(action)
     task_relation = (
         "SUPPLY_MISSING_SLOT"
@@ -232,6 +239,9 @@ def _adapt_v2_decision(decision: RouteDecision) -> RouteResult:
         "media_channels": list(decision.media_scope.channels),
         "segment": decision.market_scope.segment, "category": decision.market_scope.category,
         "comparison_metric": decision.ranking_metric,
+        "time_scope": entity.get("time_scope") or {},
+        "comparison_spec": decision.comparison_spec,
+        "business_spec": decision.business_spec,
     }
     slot_ops = {
         key: {"op": "SET", "value": value}
@@ -270,7 +280,9 @@ def _adapt_v2_decision(decision: RouteDecision) -> RouteResult:
             else None
         ),
         message=message, route_decision=decision_payload,
-        time_scope=entity.get("time_scope"), brand_resolution=brand_resolution or None,
+        time_scope=entity.get("time_scope"), comparison_spec=dict(decision.comparison_spec),
+        business_spec=dict(decision.business_spec),
+        brand_resolution=brand_resolution or None,
         task_bindings=list(decision.task_bindings),
         business_period=task_periods.get("EC_BUSINESS"),
         bet_period=task_periods.get("BET"),
@@ -319,7 +331,10 @@ def _bind_entities_to_tasks(decision: RouteDecision, entity: EntityResolution, t
         index for index, mention in enumerate(mentions)
         if mention.resolution_status == "exact" and mention.start_date and mention.end_date
     ]
-    has_comparison = bool(re.search(r"同比|对比|比较|\bvs\b|去年同期", text, re.I))
+    has_comparison = bool(re.search(
+        r"同比|对比|比较|(?<![A-Za-z0-9_])vs(?![A-Za-z0-9_])|去年同期",
+        text, re.I,
+    ))
     if len(task_intents) > 1 and len(exact_indices) >= len(task_intents) and not has_comparison:
         available = set(exact_indices)
         for intent in task_intents:
@@ -389,10 +404,70 @@ def _decision_from_entities(text: str, entity: EntityResolution) -> RouteDecisio
     return _apply_entity_resolution(decision, entity)
 
 
+def _complete_fresh_business_decision(text: str) -> RouteDecision | None:
+    """Return a complete business request that must supersede stale pending state.
+
+    A reply containing only the requested time roles is intentionally incomplete
+    here: it has no explicit subject/platform and must still resume the pending
+    clarification.  A self-contained current request, however, is a new task even
+    when it happens to mention the same brand as the pending request.
+    """
+    entity = resolve_entities(text, current_year=date.today().year)
+    decision = _decision_from_entities(text, entity)
+    if not decision:
+        return None
+    has_subject = entity.brand.status == "resolved" or "MARKET" in decision.intents
+    has_business_scope = bool(
+        set(decision.intents).intersection({"EC_BUSINESS", "MARKET"})
+        and decision.commerce_scope.platforms
+    )
+    if (
+        has_subject
+        and has_business_scope
+        and decision.period
+        and not decision.missing_slots
+        and not decision.requires_confirmation
+    ):
+        decision.reason_codes.append("FRESH_COMPLETE_REQUEST_OVERRIDE")
+        return decision
+    return None
+
+
 def _apply_entity_resolution(decision: RouteDecision, entity: EntityResolution) -> RouteDecision:
     _bind_entities_to_tasks(decision, entity, entity.text)
-    decision.entity_resolution = entity.to_dict()
+    decision.comparison_spec = build_comparison_spec(entity.time_scope, entity.text)
     is_market = "MARKET" in decision.intents
+    explicit_business_category = explicit_category(entity.text)
+    if is_market:
+        # 大众化妆品部的大盘口径默认是 Pure Mass / TTL Beauty。它们是
+        # 业务范围默认值，不是时间槽位，不能令一个完整时间计划变成澄清。
+        decision.market_scope = MarketScope(
+            decision.market_scope.segment or "PURE MASS",
+            decision.market_scope.category or "TOTAL BEAUTY",
+        )
+        decision.missing_slots = [
+            slot for slot in decision.missing_slots
+            if slot not in {"market_scope.segment", "market_scope.category"}
+        ]
+        # Router V2 decides its action before entity defaults are applied.  A
+        # complete complex plan could therefore retain the stale
+        # ``clarify_market_scope`` action even after both defaultable scope
+        # slots were removed.  Keep the existing preflight confirmation for
+        # the expensive multi-step workflow, but never ask the user to fill an
+        # empty list of market slots.
+        if (
+            decision.action == "clarify_market_scope"
+            and not decision.missing_slots
+            and "COMPLEX_MARKET_PLAN" in decision.reason_codes
+        ):
+            decision.action = "clarify_analysis_scope"
+            decision.requires_confirmation = True
+            decision.response_strategy = "CLARIFY"
+            decision.reason_codes.append("MARKET_DEFAULT_SCOPE_COMPLETED")
+    elif explicit_business_category:
+        # Macro Category is orthogonal to brand/platform/time and must survive
+        # routing even though individual execution adapters enforce capability.
+        decision.market_scope = MarketScope(None, explicit_business_category)
     if not is_market and entity.brand.status == "resolved":
         decision.brand_surface = entity.brand.surface
         decision.missing_slots = [slot for slot in decision.missing_slots if slot != "brand_surface"]
@@ -427,6 +502,39 @@ def _apply_entity_resolution(decision: RouteDecision, entity: EntityResolution) 
             blocking_action = "confirm_brand_candidate"
         elif entity.brand.status == "not_found":
             blocking_action = "clarify_v2_brand"
+    business_platform = (decision.commerce_scope.platforms or [None])[0]
+    aligned_pair_is_complete = bool(
+        "time_scope.period_roles" in entity.time_scope.missing_slots
+        and decision.comparison_spec.get("mode") == "YOY_ALIGNED"
+        and decision.comparison_spec.get("source") == "inferred_aligned_pair"
+    )
+    if aligned_pair_is_complete:
+        entity.time_scope.missing_slots = [
+            slot for slot in entity.time_scope.missing_slots
+            if slot != "time_scope.period_roles"
+        ]
+        if not entity.time_scope.missing_slots:
+            entity.time_scope.status = "exact"
+        decision.reason_codes.append("ALIGNED_YOY_PAIR_INFERRED")
+    multi_observation_yoy = bool(
+        decision.comparison_spec.get("mode") == "YOY_ALIGNED"
+        and decision.comparison_spec.get("source") == "business_default"
+        and len(decision.comparison_spec.get("analysis_periods") or []) >= 2
+        and decision.intents in (["EC_BUSINESS"], ["MARKET"])
+        and business_platform in {"TM", "DY", "JD", "TTL"}
+    )
+    if multi_observation_yoy:
+        entity.time_scope.missing_slots = [
+            slot for slot in entity.time_scope.missing_slots
+            if slot != "time_scope.period_roles"
+        ]
+        if not entity.time_scope.missing_slots:
+            entity.time_scope.status = "exact"
+        decision.action = "multi_period_business_analysis"
+        decision.requires_confirmation = False
+        decision.response_strategy = "MULTI_STEP_ANALYSIS"
+        decision.reason_codes.append("MULTI_OBSERVATION_YOY_PLAN")
+
     time_missing = set(entity.time_scope.missing_slots)
     if not blocking_action:
         if "time_scope.campaign_window" in time_missing:
@@ -442,17 +550,63 @@ def _apply_entity_resolution(decision: RouteDecision, entity: EntityResolution) 
         decision.requires_confirmation = True
         decision.confidence_level = "ambiguous"
         decision.reason_codes.extend(entity.reason_codes)
+    decision.entity_resolution = entity.to_dict()
+    spec = compile_business_analysis_spec(decision)
+    decision.business_spec = spec.to_dict() if spec else {}
     return decision
 
 
 def _resume_entity_pending(text: str, state: SessionState) -> RouteResult | None:
     pending = state.pending_request or {}
     intent = pending.get("intent")
-    if intent not in {"confirm_current_year", "provide_campaign_window", "confirm_brand_candidate"}:
+    if intent not in {
+        "confirm_current_year", "provide_campaign_window",
+        "confirm_brand_candidate", "v2_time_roles",
+    }:
         return None
     original = str(pending.get("original_text") or "").strip()
     if not original:
         return None
+    if intent == "v2_time_roles":
+        reply_entity = resolve_entities(text, current_year=date.today().year)
+        supplied = reply_entity.time_scope
+        if reply_entity.brand.status == "resolved" and pending.get("brand"):
+            pending_brand = resolve_entities(
+                str(pending["brand"]), current_year=date.today().year,
+            ).brand
+
+            def identity_names(brand) -> set[str]:
+                return {
+                    "".join(str(value or "").casefold().split())
+                    for value in [brand.surface, brand.canonical_brand_key, *brand.aliases]
+                    if str(value or "").strip()
+                }
+
+            if not identity_names(reply_entity.brand).intersection(identity_names(pending_brand)):
+                return None
+        if not supplied.focus_period or supplied.missing_slots:
+            return RouteResult(
+                type="clarify_time_roles",
+                message="请按“分析2026年7月，对比2025年7月”的格式明确主分析期和对比期。",
+            )
+        entity = resolve_entities(original, current_year=date.today().year)
+        entity.time_scope = supplied
+        decision = _decision_from_entities(original, entity)
+        if not decision:
+            return None
+        if pending.get("brand"):
+            decision.brand_surface = pending["brand"]
+        if pending.get("platform"):
+            decision.commerce_scope = CommerceScope([pending["platform"]])
+        refreshed_spec = compile_business_analysis_spec(decision)
+        decision.business_spec = refreshed_spec.to_dict() if refreshed_spec else {}
+        decision.decision_source = "context_merge"
+        decision.reason_codes.append("PENDING_TIME_ROLES_RESOLVED")
+        decision.inherited_parameters.extend([
+            key for key in ("brand_surface", "commerce_scope.platforms")
+            if key not in decision.inherited_parameters
+        ])
+        return _adapt_v2_decision(decision)
     if intent == "confirm_current_year":
         explicit_year = re.search(r"20\d{2}", text)
         accepted = bool(re.search(r"^(?:是|对|可以|确认|按今年|今年)$", text.strip()))
@@ -1180,6 +1334,8 @@ def _resume_active_task_context(text: str, state: SessionState) -> RouteResult |
         "intents": merged.intents, "goals": merged.goals,
         "media_mode": merged.media_mode, "media_channels": merged.media_channels,
         "comparison_metric": merged.comparison_metric,
+        "time_scope": merged.time_scope, "comparison_spec": merged.comparison_spec,
+        "business_spec": merged.business_spec,
         "awaiting_slot": None, "status": "active",
         "last_relation": merged.relation,
     }
@@ -1202,6 +1358,9 @@ def _resume_active_task_context(text: str, state: SessionState) -> RouteResult |
         "media_mode": merged.media_mode, "media_channels": merged.media_channels,
         "include_bet": "BET" in merged.intents or "BET" in merged.goals,
         "ranking_metric": merged.comparison_metric,
+        "time_scope": merged.time_scope,
+        "comparison_spec": merged.comparison_spec,
+        "business_spec": merged.business_spec,
         "route_decision": {
             "decision_source": "active_task_merge",
             "reason_codes": merged.reason_codes,
@@ -1977,6 +2136,27 @@ def route(user_text: str, state: SessionState) -> RouteResult:
     )
     if task_followup:
         return task_followup
+    # Time-role replies contain words such as “对比”, which also look like a
+    # narrow result follow-up. Resolve this active clarification first so a
+    # stale domain context can never capture the answer.
+    if (state.pending_request or {}).get("intent") == "v2_time_roles":
+        # A self-contained question is a new task.  Test it without inheriting
+        # session state before interpreting the text as an answer to the old
+        # clarification; otherwise same-brand questions are captured forever.
+        if (
+            os.environ.get("ROUTER_V2_ENABLED", "0") == "1"
+            and os.environ.get("ENTITY_RESOLVER_V2_ENABLED", "0") == "1"
+        ):
+            fresh_decision = _complete_fresh_business_decision(text)
+            if fresh_decision:
+                log.info(
+                    "[pending_override] pending=v2_time_roles action=%s route_id=%s",
+                    fresh_decision.action, fresh_decision.route_id,
+                )
+                return _adapt_v2_decision(fresh_decision)
+        time_role_followup = _resume_entity_pending(text, state)
+        if time_role_followup:
+            return time_role_followup
     opportunity_followup = _opportunity_followup_with_context(text, state)
     if opportunity_followup:
         return opportunity_followup

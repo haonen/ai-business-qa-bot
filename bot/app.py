@@ -9,6 +9,7 @@ from typing import TypedDict
 from bot.chains.default_chain import run_default_chain
 from bot.chains.brand_business_investment_chain import run_brand_business_investment_chain
 from bot.chains.douyin_business_chain import run_douyin_business_chain
+from bot.chains.multi_period_business_chain import run_multi_period_business_chain
 from bot.chains.jd_business_chain import run_jd_business_chain
 from bot.chains.three_platform_competitor_chain import run_three_platform_competitor_chain
 from bot.chains.media_chain import run_media_chain
@@ -23,6 +24,7 @@ from bot.skills.loader import load_meta_answers
 from bot.meta_capability import dynamic_meta_enabled, render_meta_answer
 from bot.tools.query_data_availability import query_data_availability
 from bot.followup_plan import is_narrow_followup
+from bot.execution_recovery import build_period_revision_request
 from bot.chains.followup_v2_chain import run_followup_v2_chain
 from bot.chains.market_chain import run_market_chain
 from bot.market_plan import MarketPlan
@@ -191,9 +193,30 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
         }
         return state
     if route_result.type == "clarify_time_roles":
-        set_pending_request(open_id, None)
+        decision = route_result.route_decision or {}
+        entity = decision.get("entity_resolution") or {}
+        existing = session.pending_request or {}
+        set_pending_request(open_id, {
+            "intent": "v2_time_roles",
+            "original_text": (
+                entity.get("text") or route_result.original_text
+                or existing.get("original_text") or state["user_text"]
+            ),
+            "intents": decision.get("intents") or existing.get("intents") or ["EC_BUSINESS"],
+            "brand": route_result.brand or existing.get("brand"),
+            "brand_aliases": route_result.brand_aliases or existing.get("brand_aliases") or [],
+            "period": route_result.period or existing.get("period"),
+            "platform": route_result.platform or existing.get("platform"),
+            "question_mode": route_result.question_mode or existing.get("question_mode"),
+            "time_scope": route_result.time_scope or existing.get("time_scope") or {},
+            "comparison_spec": route_result.comparison_spec or existing.get("comparison_spec") or {},
+            "business_spec": route_result.business_spec or existing.get("business_spec") or {},
+        })
         state["markdown"] = route_result.message or "请明确主分析期和对比期。"
-        state["meta"] = {"document_ready": False, "awaiting": "time_roles"}
+        state["meta"] = {
+            "document_ready": False, "awaiting": "time_roles",
+            "route_decision": decision,
+        }
         return state
     if route_result.type == "clarify_media_scope":
         decision = route_result.route_decision or {}
@@ -425,7 +448,6 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
         state["meta"] = {"document_ready": False, "awaiting": "period", "domain": "market"}
         return state
     if route_result.type == "default_chain":
-        set_pending_request(open_id, None)
         result = run_default_chain(
             route_result.brand or "",
             route_result.period or "",
@@ -434,18 +456,83 @@ def _run_direct(state: AgentState, on_progress=None) -> AgentState:
         )
         state["markdown"] = result["markdown"]
         state["meta"] = result.get("meta", {})
+        recovery_request = build_period_revision_request(
+            result,
+            original_text=route_result.original_text or state["user_text"],
+            brand=route_result.brand,
+            brand_aliases=route_result.brand_aliases or [],
+            platform=route_result.platform or "TM",
+            intents=(route_result.route_decision or {}).get("intents") or ["EC_BUSINESS"],
+            comparison_spec=route_result.comparison_spec or {},
+            time_scope=route_result.time_scope or {},
+            business_spec=route_result.business_spec or {},
+        )
+        if recovery_request:
+            set_pending_request(open_id, recovery_request)
+            state["meta"]["awaiting"] = "period"
+            log.info(
+                "[execution_recovery] code=%s brand=%s platform=%s latest_date=%s",
+                state["meta"].get("error_code"), route_result.brand,
+                route_result.platform or "TM", state["meta"].get("latest_date"),
+            )
+        else:
+            set_pending_request(open_id, None)
         update_context(
             open_id,
             brand=state["meta"].get("brand"),
             tmall_brand=state["meta"].get("tmall_brand"),
             brand_aliases=state["meta"].get("brand_aliases"),
             period=state["meta"].get("period"),
+            platform=route_result.platform or "TM",
             category=state["meta"].get("selected_category"),
             series=state["meta"].get("selected_series"),
             last_analysis_view="default_analysis",
         )
         if state["meta"].get("last_result_cache"):
             _persist_ec_report(open_id, state["meta"], "TM")
+        return state
+    if route_result.type == "multi_period_business_analysis":
+        set_pending_request(open_id, None)
+        business_spec = route_result.business_spec or {}
+        subject_scope = business_spec.get("subject_scope") or (
+            "market" if route_result.brand is None else "brand"
+        )
+        log.info(
+            "[multi_period_plan] business_spec=%s",
+            business_spec,
+        )
+        result = run_multi_period_business_chain(
+            route_result.brand or "",
+            route_result.platform or "",
+            route_result.comparison_spec or {},
+            brand_aliases=route_result.brand_aliases,
+            subject_scope=subject_scope,
+            segment=business_spec.get("segment") or route_result.segment or "PURE MASS",
+            category=business_spec.get("category") or route_result.category or "TOTAL BEAUTY",
+            on_progress=on_progress,
+        )
+        state["markdown"] = result["markdown"]
+        state["meta"] = result.get("meta", {})
+        if subject_scope == "market":
+            update_market_context(
+                open_id, period=state["meta"].get("period") or route_result.period,
+                segment=state["meta"].get("segment") or route_result.segment or "PURE MASS",
+                platform=route_result.platform,
+                category=state["meta"].get("category") or route_result.category or "TOTAL BEAUTY",
+                last_view="multi_period_business_analysis",
+            )
+        else:
+            update_context(
+                open_id,
+                brand=state["meta"].get("brand") or route_result.brand,
+                brand_aliases=route_result.brand_aliases or [],
+                period=state["meta"].get("period") or route_result.period,
+                platform=route_result.platform,
+                category=route_result.category,
+                last_analysis_view="multi_period_business_analysis",
+            )
+        if state["meta"].get("last_result_cache"):
+            set_cache(open_id, state["meta"]["last_result_cache"])
         return state
     if route_result.type == "brand_business_investment_analysis":
         set_pending_request(open_id, None)
@@ -694,6 +781,7 @@ def build_graph():
     graph.add_node("default_chain", lambda s: _run_direct(s))
     graph.add_node("brand_business_investment_analysis", lambda s: _run_direct(s))
     graph.add_node("douyin_business_analysis", lambda s: _run_direct(s))
+    graph.add_node("multi_period_business_analysis", lambda s: _run_direct(s))
     graph.add_node("jd_business_analysis", lambda s: _run_direct(s))
     graph.add_node("three_platform_competitor_analysis", lambda s: _run_direct(s))
     graph.add_node("media_analysis", lambda s: _run_direct(s))
@@ -731,6 +819,7 @@ def build_graph():
         "default_chain": "default_chain",
         "brand_business_investment_analysis": "brand_business_investment_analysis",
         "douyin_business_analysis": "douyin_business_analysis",
+        "multi_period_business_analysis": "multi_period_business_analysis",
         "jd_business_analysis": "jd_business_analysis",
         "three_platform_competitor_analysis": "three_platform_competitor_analysis",
         "media_analysis": "media_analysis",
@@ -742,7 +831,7 @@ def build_graph():
         "skill_dispatch": "skill_dispatch",
     })
     for node in [
-        "meta_reply", "caliber_reject", "guide", "market_parameter_error", "unsupported_scope", "confirm_current_year", "provide_campaign_window", "confirm_brand_candidate", "clarify_time_roles", "clarify_media_scope", "clarify_v2_period", "clarify_v2_brand", "clarify_market_scope", "clarify_analysis_scope", "clarify_period", "clarify_business_platform", "clarify_ec_platform", "clarify_douyin_period", "clarify_jd_period", "clarify_three_platform_brand", "clarify_three_platform_period", "default_chain", "brand_business_investment_analysis", "douyin_business_analysis", "jd_business_analysis", "three_platform_competitor_analysis",
+        "meta_reply", "caliber_reject", "guide", "market_parameter_error", "unsupported_scope", "confirm_current_year", "provide_campaign_window", "confirm_brand_candidate", "clarify_time_roles", "clarify_media_scope", "clarify_v2_period", "clarify_v2_brand", "clarify_market_scope", "clarify_analysis_scope", "clarify_period", "clarify_business_platform", "clarify_ec_platform", "clarify_douyin_period", "clarify_jd_period", "clarify_three_platform_brand", "clarify_three_platform_period", "default_chain", "brand_business_investment_analysis", "douyin_business_analysis", "multi_period_business_analysis", "jd_business_analysis", "three_platform_competitor_analysis",
         "media_analysis", "market_analysis", "market_brand_ranking", "market_brand_deep_dive", "brand_platform_deep_dive", "clarify_market_period", "filter_update", "skill_dispatch",
     ]:
         graph.add_edge(node, END)
@@ -776,7 +865,7 @@ def run_agent(open_id: str, user_text: str, session: SessionState, on_progress=N
             current_turn=user_text,
         )
     elif route_result.type in {
-        "default_chain", "douyin_business_analysis", "jd_business_analysis",
+        "default_chain", "douyin_business_analysis", "multi_period_business_analysis", "jd_business_analysis",
         "three_platform_competitor_analysis", "brand_platform_deep_dive",
         "brand_business_investment_analysis", "media_analysis", "market_analysis",
         "market_brand_ranking", "market_brand_deep_dive",
@@ -798,6 +887,9 @@ def run_agent(open_id: str, user_text: str, session: SessionState, on_progress=N
             "period": route_result.period, "platform": route_result.platform,
             "media_mode": route_result.media_mode,
             "media_channels": route_result.media_channels or [],
+            "time_scope": route_result.time_scope or {},
+            "comparison_spec": route_result.comparison_spec or {},
+            "business_spec": route_result.business_spec or {},
             "segment": route_result.segment, "category": route_result.category,
             "comparison_metric": route_result.ranking_metric,
             "awaiting_slot": None, "status": "active",
