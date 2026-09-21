@@ -30,6 +30,11 @@ validate_runtime_env()
 APP_ID = get_env("FEISHU_APP_ID", "APP_ID")
 APP_SECRET = get_env("FEISHU_APP_SECRET", "APP_SECRET")
 
+
+def _feishu_ws_log_level():
+    level_name = os.environ.get("FEISHU_WS_LOG_LEVEL", "WARNING").strip().upper()
+    return getattr(lark.LogLevel, level_name, lark.LogLevel.WARNING)
+
 cli = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 _lock_file = None
 _processed: set[str] = set()
@@ -209,7 +214,9 @@ def main():
         APP_ID,
         APP_SECRET,
         event_handler=event_handler,
-        log_level=lark.LogLevel.DEBUG,
+        # INFO/DEBUG from the SDK includes temporary WebSocket credentials in
+        # the connection URL, so production-like environments default to WARNING.
+        log_level=_feishu_ws_log_level(),
     )
     lark.logger.info("Starting AI Business QA Bot WebSocket long-connection...")
     ws_client.start()
