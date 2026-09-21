@@ -33,6 +33,7 @@
 - 已完成代码 / 知识文件：本地目录 `/Users/shuoyang/北极星/ai-business-qa-bot-staging`；服务器目录 `/srv/ai-business-qa-bot-staging`；独立用户 `ai-bot-staging`；独立 venv；Redis `127.0.0.1:6380`；独立队列与 systemd 服务模板。
 - 配置校正：发现仓库旧示例仍使用 Qwen 模型名；已将根目录示例、staging 模板和服务器 staging 配置统一为生产当前使用的 `glm-5.2`。未复制生产 API Key，测试 Bot 仍保持关闭。
 - 数据库隔离：MySQL 测试账号按 `172.31.0.2` 来源限制并仅授予业务库 `SELECT, SHOW VIEW`；staging 请求审计关闭，避免只读账号执行审计写入。品牌解析缓存写入仍需后续改为独立测试存储或显式关闭。
+- 端到端验证：测试飞书应用收到“欧莱雅 2026-08-20 天猫生意”问题，任务仅进入 `ai-bot-staging`，`default_chain` 在约 128 秒内完成并成功回发；队列 0 失败、0 堆积，业务查询和 GLM 调用正常。只读账号拒绝了 `ai_bot_source_brand_resolution_cache` 的缓存写入，异常被现有代码捕获且不影响结果；后续需消除该非致命警告。
 - 隔离与预算：staging slice 合计上限 180% CPU、6 GiB 内存、256 tasks；1 个分析 worker、1 个文档 worker、1 个内部查询并发、DB pool=1。
 - 测试命令、环境、通过/失败/跳过数量及结果位置：Python 编译通过；staging Redis `PING` 通过；`tests.test_queue_runtime` 19 项全部通过。从生产基线选取的扩展用例共 42 项，7 项失败、11 项报错，原因包括生产测试文件与实现版本不一致及未配置模型凭据，已作为起始基线问题记录。
 - 真实对数与飞书测试证据：未进行；staging receiver/worker 保持 disabled/inactive，不复用生产飞书应用。
