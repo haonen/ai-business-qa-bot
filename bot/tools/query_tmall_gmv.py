@@ -16,8 +16,14 @@ def query_tmall_gmv(
     prior_end: str,
 ) -> dict:
     """按bus_date和brand_name聚合Tmall GMV，返回当前期间与上年同期。"""
+    def execute(sql,params):
+        from bot.brand_query import enabled,apply_brand_predicate
+        if enabled():
+            sql,params,_=apply_brand_predicate(sql,params,brand=brand,
+                table='ai_bot_tmall_product_link',field='brand_name')
+        return fetch_df(sql,params)
     try:
-        df = fetch_df(
+        df = execute(
             """
             SELECT
                 'current' AS period_type,
@@ -25,7 +31,7 @@ def query_tmall_gmv(
                 COUNT(*) AS row_count,
                 MIN(CAST(bus_date AS DATE)) AS min_date,
                 MAX(CAST(bus_date AS DATE)) AS max_date
-            FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+            FROM ai_bot_tmall_product_link
             WHERE brand_name = :brand
               AND CAST(bus_date AS DATE) BETWEEN :focus_start AND :focus_end
 
@@ -37,7 +43,7 @@ def query_tmall_gmv(
                 COUNT(*) AS row_count,
                 MIN(CAST(bus_date AS DATE)) AS min_date,
                 MAX(CAST(bus_date AS DATE)) AS max_date
-            FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+            FROM ai_bot_tmall_product_link
             WHERE brand_name = :brand
               AND CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
             """,

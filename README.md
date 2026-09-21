@@ -156,6 +156,12 @@ source .venv/bin/activate
 python -m bot.main
 ```
 
+For Redis/RQ queue mode, configurable worker counts, systemd services, health
+checks, and rollout instructions, see
+[`docs/redis_queue_deployment.md`](docs/redis_queue_deployment.md). Queue mode
+is disabled by default so deploying the code does not change the existing
+synchronous runtime until Redis and the worker pool are ready.
+
 The v3 runtime code lives under:
 
 ```text

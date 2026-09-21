@@ -110,6 +110,11 @@ def _platform_and_month_analysis(coverage: list[dict], brands: list[str]) -> dic
     return output
 
 
+def build_brand_platform_matrix(coverage: list[dict], brands: list[str]) -> dict[str, dict]:
+    """Public, SQL-free adapter used by the executable Plan capability."""
+    return _platform_and_month_analysis(coverage, brands)
+
+
 def _event_labels(period_meta: dict) -> list[str]:
     start = pd.Timestamp(period_meta["current_start"])
     end = pd.Timestamp(period_meta["current_end"])
@@ -142,7 +147,7 @@ def _query_tmall_products(brand: str, period_meta: dict) -> pd.DataFrame:
           MAX(product_title) AS product_name,
           SUM(gmv) AS gmv,
           SUM(unit) AS unit
-        FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+        FROM ai_bot_tmall_product_link
         WHERE brand_name = :brand
           AND (CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
                OR CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end)
@@ -170,6 +175,7 @@ def _query_douyin_products(brand: str, period_meta: dict) -> pd.DataFrame:
           NULL AS unit
         FROM ai_bot_dy_product_link
         WHERE `商品品牌` = :brand
+          AND NULLIF(TRIM(`商品四级分类`), '') IS NOT NULL
           AND (CAST(`业务日期` AS DATE) BETWEEN :current_start AND :current_end
                OR CAST(`业务日期` AS DATE) BETWEEN :prior_start AND :prior_end)
         GROUP BY period_key, source_month, CAST(`商品ID` AS CHAR)
@@ -222,12 +228,14 @@ def query_market_brand_deep_dive(
     brand_limit: int = 3,
     platform: str = "TTL",
     ranking_metric: str = "gmv_growth",
+    category: str = "TOTAL BEAUTY",
 ) -> dict:
     """Select representative Mass brands and analyze platforms, rhythm and products."""
     try:
         ranking = query_market_top_brands(
             period=period, segment=segment, platform=platform,
-            ranking_metric=ranking_metric, limit=max(brand_limit, 20)
+            ranking_metric=ranking_metric, limit=max(brand_limit, 20),
+            category=category,
         )
         if ranking.get("error"):
             return ranking
@@ -260,7 +268,7 @@ def query_market_brand_deep_dive(
                 "segment": segment,
                 "platform": platform,
                 "ranking_metric": ranking_metric,
-                "category": "Total Beauty",
+                "category": category,
                 "current_period": [parsed["current_start"], parsed["current_end"]],
                 "prior_period": [parsed["prior_start"], parsed["prior_end"]],
             },

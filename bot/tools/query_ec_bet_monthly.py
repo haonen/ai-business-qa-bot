@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from bot.brand_query import enabled as brand_gate_enabled, _scope
 
 from bot.db.connection import fetch_df
 
 from bot.media_period import parse_media_period
+from bot.runtime_config import bounded_query_workers
 from bot.tools.common import tool
 from bot.tools.followup_common import month_keys, standard_result
 from bot.tools.query_bet_followup_table import query_bet_followup_table
@@ -51,13 +54,15 @@ def query_ec_bet_monthly(
 ) -> dict:
     """Align monthly EC and BET evidence; returns signals, never causal claims."""
     try:
+        if brand_gate_enabled():
+            source_brands = {key: brand for key in ("tmall", "topline", "search", "ksi")}
         parsed = parse_media_period(period)
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="followup-link") as executor:
+        with ThreadPoolExecutor(max_workers=bounded_query_workers(4), thread_name_prefix="followup-link") as executor:
             tasks = {
-                "ec": executor.submit(_query_tmall_ttl_monthly, (source_brands or {}).get("tmall"), parsed),
-                "media": executor.submit(query_bet_followup_table, brand, period, ["month"], {}, ["spend_actual", "spend_evol", "nso_actual", "nso_evol", "fee_ratio", "fee_ratio_change"], 50, source_brands),
-                "search": executor.submit(query_bet_followup_table, brand, period, ["month"], {}, ["search_actual", "search_evol"], 50, source_brands),
-                "kol": executor.submit(query_bet_followup_table, brand, period, ["month"], {}, ["cost_actual", "cost_evol", "engage_actual", "engage_evol", "cpe"], 50, source_brands),
+                "ec": executor.submit(copy_context().run, _query_tmall_ttl_monthly, (source_brands or {}).get("tmall"), parsed),
+                "media": executor.submit(copy_context().run, query_bet_followup_table, brand, period, ["month"], {}, ["spend_actual", "spend_evol", "nso_actual", "nso_evol", "fee_ratio", "fee_ratio_change"], 50, source_brands),
+                "search": executor.submit(copy_context().run, query_bet_followup_table, brand, period, ["month"], {}, ["search_actual", "search_evol"], 50, source_brands),
+                "kol": executor.submit(copy_context().run, query_bet_followup_table, brand, period, ["month"], {}, ["cost_actual", "cost_evol", "engage_actual", "engage_evol", "cpe"], 50, source_brands),
             }
             results = {name: task.result() for name, task in tasks.items()}
         months = month_keys(parsed.focus_start, parsed.focus_end)
@@ -81,7 +86,7 @@ def query_ec_bet_monthly(
                 row["search_signal"] = "搜索增长但GMV未同步"
             rows.append(row)
         return standard_result(
-            query_meta={"domain": "ec_bet", "brand": brand, "period": period, "group_by": ["month"]},
+            query_meta={"domain": "ec_bet", "ec_category": (_scope.get().category if brand_gate_enabled() and _scope.get() else "TTL"), "bet_category": "TTL", "scope_note": "电商按所选品类，BET为品牌整体，不能视为该品类投入", "brand": brand, "period": period, "group_by": ["month"]},
             filters={}, totals={}, rows=rows,
             coverage={"requested_months": months, "sources": {name: result.get("coverage", {}) for name, result in results.items()}},
             missing=[{"source": name, "error": result.get("error"), "message": result.get("message")} for name, result in results.items() if result.get("error")],

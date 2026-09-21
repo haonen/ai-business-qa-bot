@@ -1,9 +1,12 @@
 from __future__ import annotations
+from bot.template_scope import scoped_template
 
 from bot.jd_business_formatter import format_jd_business_report
+from bot.failures import failure_meta
 from bot.tools.query_jd_business import query_jd_business
 
 
+@scoped_template('JD', whole_brand=False)
 def run_jd_business_chain(
     brand: str,
     period: str,
@@ -27,12 +30,10 @@ def run_jd_business_chain(
         return {
             "ok": False,
             "markdown": result.get("message") or "京东品牌生意分析失败。",
-            "meta": {
-                "brand": brand,
-                "period": period,
-                "document_ready": False,
-                "domain": "jd_business",
-            },
+            "meta": failure_meta(
+                result, brand=brand, period=period,
+                platform="JD", domain="jd_business",
+            ),
         }
     if on_progress:
         on_progress("数据已对齐，正在生成京东品牌生意分析…")

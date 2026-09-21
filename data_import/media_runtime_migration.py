@@ -68,6 +68,7 @@ def _ensure_column(table_name: str, column_name: str, definition: str):
 
 
 def main():
+    _ensure_table("request_audit.sql")
     _ensure_table("brand_dictionary.sql")
     _ensure_table("brand_resolution_cache.sql")
     _ensure_table("source_brand_resolution_cache.sql")
@@ -91,6 +92,11 @@ def main():
         "ai_bot_dy_product_link",
         "idx_dy_brand_date",
         "`商品品牌`, `业务日期`",
+    )
+    _ensure_index(
+        "dy_store_ranking_BFSS_day_jiashicang",
+        "idx_dy_store_brand_date",
+        "brand_name(100), bus_date",
     )
     _ensure_index(
         "top_brands_total_ec",

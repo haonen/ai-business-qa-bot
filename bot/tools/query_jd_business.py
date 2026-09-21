@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from bot.store_report_scope import amount_sql as store_amount
+import logging
+import os
 from typing import Iterable
 
 import pandas as pd
 
 from bot.db.connection import fetch_df, fetch_one
+from bot.failures import (
+    AnalysisFailure, INVALID_PERIOD, StructuredAnalysisError,
+    data_coverage_failure, failure_result, infrastructure_failure,
+)
 from bot.media_brand import normalize_brand, resolve_source_brand
+from bot.platforms import platform_filter_sql
+from bot.period_coverage import normalize_period_to_latest
 from bot.tools.common import tool
 from bot.tools.market_common import month_slices
 from bot.utils import parse_ec_period, safe_div, safe_evol
@@ -14,6 +23,7 @@ from bot.utils import parse_ec_period, safe_div, safe_evol
 JD_DAILY_TABLE = "jd_store_ranking_selfrun_day_jiashicang"
 MONTHLY_TABLE = "three_platform_store_rank_monthly"
 DISPLAY_CATEGORY_LIMIT = 6
+log = logging.getLogger(__name__)
 
 
 def _amount_sql(column: str) -> str:
@@ -58,6 +68,8 @@ def _resolve_jd_brand(
     brand: str,
     brand_aliases: Iterable[str] | None = None,
 ) -> dict:
+    from bot.brand_query import enabled
+    if enabled():return {'brand':brand,'match_method':'unified_per_table'}
     values = _brand_values(brand, brand_aliases)
     if not values:
         return {"error": "missing_brand", "message": "请提供需要分析的品牌。"}
@@ -76,7 +88,7 @@ def _resolve_jd_brand(
         SELECT DISTINCT TRIM(brand_name) AS source_brand
         FROM {MONTHLY_TABLE}
         WHERE brand_name IN ({placeholders})
-          AND UPPER(TRIM(platform)) = 'JD'
+          AND {platform_filter_sql(MONTHLY_TABLE, 'JD')}
         """,
         params,
     )
@@ -104,6 +116,23 @@ def _resolve_jd_brand(
     }
 
 
+def _mapped_query(fetcher, table, sql, params):
+    from bot.brand_query import enabled,apply_brand_predicate,require_platform
+    if enabled():
+        require_platform('JD')
+        sql,params,_=apply_brand_predicate(sql,params,brand=params['brand'],table=table,
+            field='brand_name',predicate='TRIM(brand_name) = :brand')
+    return fetcher(sql,params)
+
+
+def _mapped_fetch_df(table,sql,params):
+    return _mapped_query(fetch_df,table,sql,params)
+
+
+def _mapped_fetch_one(table,sql,params):
+    return _mapped_query(fetch_one,table,sql,params)
+
+
 def _fetch_category_slice(
     *,
     table: str,
@@ -113,13 +142,15 @@ def _fetch_category_slice(
     end: str,
     monthly: bool,
 ) -> pd.DataFrame:
-    platform_clause = "AND UPPER(TRIM(platform)) = 'JD'" if monthly else ""
-    return fetch_df(
+    platform_clause = (
+        "AND " + platform_filter_sql(MONTHLY_TABLE, "JD") if monthly else ""
+    )
+    return _mapped_fetch_df(table,
         f"""
         SELECT
           :period_key AS period_key,
           COALESCE(NULLIF(TRIM(category_level_3), ''), '未分类') AS category_level_3,
-          SUM({_amount_sql('gmv')}) AS gmv,
+          SUM({store_amount(_amount_sql('gmv'),'JD')}) AS gmv,
           COUNT(*) AS row_count
         FROM {table}
         WHERE TRIM(brand_name) = :brand
@@ -140,40 +171,56 @@ def _query_category_frames(
     brand: str,
     period_meta: dict,
 ) -> tuple[pd.DataFrame, list[dict], list[dict]]:
-    frames: list[pd.DataFrame] = []
-    sources: list[dict] = []
-    missing: list[dict] = []
+    business_date = "CAST(bus_date AS DATE)"
+    frame = _mapped_fetch_df(JD_DAILY_TABLE,
+        f"""
+        SELECT
+          CASE
+            WHEN {business_date} BETWEEN :current_start AND :current_end THEN 'current'
+            ELSE 'prior'
+          END AS period_key,
+          DATE_FORMAT({business_date}, '%Y-%m') AS source_month,
+          COALESCE(NULLIF(TRIM(category_level_3), ''), '未分类') AS category_level_3,
+          SUM({store_amount(_amount_sql('gmv'),'JD')}) AS gmv,
+          COUNT(*) AS row_count
+        FROM {JD_DAILY_TABLE}
+        WHERE TRIM(brand_name) = :brand
+          AND (
+            {business_date} BETWEEN :current_start AND :current_end
+            OR {business_date} BETWEEN :prior_start AND :prior_end
+          )
+        GROUP BY period_key, source_month,
+                 COALESCE(NULLIF(TRIM(category_level_3), ''), '未分类')
+        """,
+        {
+            "brand": brand,
+            **{key: period_meta[key] for key in (
+                "current_start", "current_end", "prior_start", "prior_end",
+            )},
+        },
+    )
+    sources = []
+    missing = []
+    present = set()
+    if not frame.empty:
+        present = {
+            (str(row["period_key"]), str(row["source_month"]))
+            for _, row in frame[["period_key", "source_month"]].drop_duplicates().iterrows()
+        }
     for period_key, start_key, end_key in (
         ("current", "current_start", "current_end"),
         ("prior", "prior_start", "prior_end"),
     ):
         for item in _source_slices(period_meta[start_key], period_meta[end_key]):
-            frame = _fetch_category_slice(
-                table=item["table"],
-                brand=brand,
-                period_key=period_key,
-                start=item["start"],
-                end=item["end"],
-                monthly=item["source"] == "monthly",
-            )
-            selected_source = item["source"]
-            selected_table = item["table"]
             source_row = {
-                "period": period_key,
-                "month": item["month"],
-                "source": selected_source,
-                "table": selected_table,
-                "start": item["start"],
-                "end": item["end"],
+                "period": period_key, "month": item["month"],
+                "source": "daily", "table": JD_DAILY_TABLE,
+                "start": item["start"], "end": item["end"],
             }
             sources.append(source_row)
-            if frame.empty:
+            if (period_key, item["month"]) not in present:
                 missing.append(source_row)
-            else:
-                frames.append(frame)
-    if not frames:
-        return pd.DataFrame(), sources, missing
-    return pd.concat(frames, ignore_index=True), sources, missing
+    return frame, sources, missing
 
 
 def _paired_category_rows(frame: pd.DataFrame) -> tuple[dict, list[dict]]:
@@ -261,29 +308,61 @@ def query_jd_business(
         if resolved.get("error"):
             return resolved
         source_brand = str(resolved["brand"])
-        daily_max = fetch_one(
+        daily_max = _mapped_fetch_one(JD_DAILY_TABLE,
             f"SELECT MAX(CAST(bus_date AS DATE)) AS max_date FROM {JD_DAILY_TABLE} "
             "WHERE TRIM(brand_name) = :brand",
             {"brand": source_brand},
         ).get("max_date")
-        monthly_max = fetch_one(
+        monthly_max = _mapped_fetch_one(MONTHLY_TABLE,
             f"SELECT MAX(CAST(bus_date AS DATE)) AS max_date FROM {MONTHLY_TABLE} "
-            "WHERE TRIM(brand_name) = :brand AND UPPER(TRIM(platform)) = 'JD'",
+            "WHERE TRIM(brand_name) = :brand AND "
+            + platform_filter_sql(MONTHLY_TABLE, "JD"),
             {"brand": source_brand},
         ).get("max_date")
         latest_values = [str(value)[:10] for value in (daily_max, monthly_max) if value]
         if not latest_values:
             return {"error": "no_data", "message": f"京东数据中没有找到品牌“{brand}”。"}
-        source_max_date = max(latest_values)
-        period_meta = parse_ec_period(period, int(source_max_date[:4]))
+        legacy_emergency = os.environ.get(
+            "LEGACY_PIPELINE_EMERGENCY", "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # The report query uses the daily self-run table, so its max date is
+        # authoritative in the new pipeline. Keep the old choice for manual
+        # rollback compatibility.
+        source_max_date = (
+            max(latest_values) if legacy_emergency else str(daily_max)[:10]
+            if daily_max else max(latest_values)
+        )
+        try:
+            period_meta = parse_ec_period(period, int(source_max_date[:4]))
+        except ValueError as exc:
+            return failure_result(AnalysisFailure(
+                failure_kind=INVALID_PERIOD, user_message=str(exc),
+                requested_period=str(period), retry_slot="period",
+                preserved_slots=("brand", "platform", "goals"),
+            ))
+        period_meta, adjustment = normalize_period_to_latest(period_meta, source_max_date)
+        if adjustment:
+            log.info(
+                "[jd_business] MTD coverage adjusted brand=%s requested=%s effective_end=%s",
+                source_brand, period, period_meta["current_end"],
+            )
+        if period_meta["current_start"] > source_max_date:
+            return failure_result(data_coverage_failure(
+                brand=brand, platform_label="京东",
+                requested_period=str(period), latest_available_date=source_max_date,
+                after_latest=True,
+            ))
         frame, sources, missing = _query_category_frames(source_brand, period_meta)
         if missing:
-            detail = "、".join(
-                f"{row['period']} {row['month']}({row['source']})" for row in missing
-            )
-            return {"error": "incomplete_coverage", "message": f"京东品牌/品类数据存在缺口：{detail}。"}
+            return failure_result(data_coverage_failure(
+                brand=brand, platform_label="京东",
+                requested_period=str(period), latest_available_date=source_max_date,
+            ), error="incomplete_coverage")
         if frame.empty:
-            return {"error": "no_data", "message": f"品牌“{source_brand}”在指定期间没有京东数据。"}
+            return failure_result(data_coverage_failure(
+                brand=brand, platform_label="京东",
+                requested_period=str(period), latest_available_date=source_max_date,
+            ), error="no_data")
         total, all_categories = _paired_category_rows(frame)
         displayed = _combine_other(all_categories, total)
         display_current = sum(row["gmv_current"] for row in displayed)
@@ -312,5 +391,7 @@ def query_jd_business(
                 "displayed_categories_prior": display_prior,
             },
         }
+    except StructuredAnalysisError as exc:
+        return failure_result(exc.failure)
     except Exception as exc:
-        return {"error": "execution_error", "message": str(exc)}
+        return failure_result(infrastructure_failure(exc, requested_period=str(period)))

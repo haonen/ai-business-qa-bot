@@ -33,9 +33,15 @@
   "max_rows": 50,
   "sku_requires_filter": true,
   "tools": [
-    "query_ec_followup_table", "query_bet_followup_table",
+    "query_ec_followup_table", "query_douyin_followup_table", "query_bet_followup_table",
     "query_change_contribution", "query_ec_bet_monthly"
   ],
+  "platform_capabilities": {
+    "TM": ["category", "key_driver", "series", "sku"],
+    "DY": ["category", "key_driver", "series", "sku", "product_title", "product_link"],
+    "JD": ["category"],
+    "TTL": ["platform"]
+  },
   "insight_rules": {
     "dominant_share": 0.7,
     "leading_share": 0.5,

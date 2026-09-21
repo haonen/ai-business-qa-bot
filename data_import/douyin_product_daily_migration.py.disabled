@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import argparse
+import json
+from typing import Any
+
+from bot.db.connection import fetch_df, fetch_one, get_engine
+
+
+TABLE = "dy_goodssales_rank_day_jiashicang"
+DRIVER_FIELDS = (
+    "品牌自营直播销量",
+    "达人推广直播销量",
+    "品牌自营作品销量",
+    "达人推广作品销量",
+    "商品卡销量",
+)
+
+
+def numeric_sql(column: str) -> str:
+    return (
+        f"COALESCE(CAST(REPLACE(NULLIF(TRIM(`{column}`), ''), ',', '') "
+        "AS DECIMAL(24,4)), 0)"
+    )
+
+
+def invalid_numeric_sql(column: str) -> str:
+    normalized = f"REPLACE(TRIM(`{column}`), ',', '')"
+    return (
+        f"(`{column}` IS NOT NULL AND TRIM(`{column}`) <> '' "
+        f"AND {normalized} NOT REGEXP '^-?[0-9]+(\\\\.[0-9]+)?$')"
+    )
+
+
+STORE_HIT = f"({numeric_sql('品牌自营直播销量')} <> 0)"
+KOL_HIT = f"({numeric_sql('达人推广直播销量')} <> 0)"
+VIDEO_HIT = (
+    f"(({numeric_sql('品牌自营作品销量')} <> 0) OR "
+    f"({numeric_sql('达人推广作品销量')} <> 0))"
+)
+PRODUCT_TAB_HIT = f"({numeric_sql('商品卡销量')} <> 0)"
+HIT_COUNT = f"({STORE_HIT} + {KOL_HIT} + {VIDEO_HIT} + {PRODUCT_TAB_HIT})"
+KEY_DRIVER_DEFINITION = f"""VARCHAR(32) GENERATED ALWAYS AS (
+  CASE
+    WHEN {HIT_COUNT} >= 2 THEN 'Needs review'
+    WHEN {STORE_HIT} THEN 'Store live'
+    WHEN {KOL_HIT} THEN 'KOL live'
+    WHEN {VIDEO_HIT} THEN 'Video'
+    WHEN {PRODUCT_TAB_HIT} THEN 'Product tab'
+    ELSE NULL
+  END
+) STORED"""
+
+
+def _execute(sql: str) -> None:
+    from sqlalchemy import text
+
+    with get_engine().begin() as connection:
+        connection.execute(text(sql))
+
+
+def _column_exists(column_name: str) -> bool:
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS count_value
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = :table_name
+          AND column_name = :column_name
+        """,
+        {"table_name": TABLE, "column_name": column_name},
+    )
+    return bool(row.get("count_value"))
+
+
+def _index_exists(index_name: str) -> bool:
+    row = fetch_one(
+        """
+        SELECT COUNT(*) AS count_value
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = :table_name
+          AND index_name = :index_name
+        """,
+        {"table_name": TABLE, "index_name": index_name},
+    )
+    return bool(row.get("count_value"))
+
+
+def migrate() -> dict[str, Any]:
+    actions: list[str] = []
+    alter_clauses: list[str] = []
+    if not _column_exists("key_driver"):
+        alter_clauses.append(f"ADD COLUMN `key_driver` {KEY_DRIVER_DEFINITION}")
+        actions.append("created key_driver")
+    else:
+        actions.append("key_driver already exists")
+
+    indexes = {
+        "idx_dy_goods_brand_category_date": "`\u5546\u54c1\u54c1\u724c`(100), `\u5546\u54c1\u56db\u7ea7\u5206\u7c7b`, `\u4e1a\u52a1\u65e5\u671f`",
+        "idx_dy_goods_brand_driver_date": "`\u5546\u54c1\u54c1\u724c`(100), `key_driver`, `\u4e1a\u52a1\u65e5\u671f`",
+    }
+    for index_name, columns in indexes.items():
+        if _index_exists(index_name):
+            actions.append(f"{index_name} already exists")
+            continue
+        alter_clauses.append(f"ADD INDEX `{index_name}` ({columns})")
+        actions.append(f"created {index_name}")
+    # Combine all missing changes so the large fact table is not rebuilt or
+    # scanned independently for the generated column and each index.
+    if alter_clauses:
+        _execute(f"ALTER TABLE `{TABLE}` " + ", ".join(alter_clauses))
+    return {"table": TABLE, "actions": actions}
+
+
+def quality_report() -> dict[str, Any]:
+    invalid_parts = [invalid_numeric_sql(column) for column in DRIVER_FIELDS]
+    invalid_any = " OR ".join(invalid_parts)
+    sales = numeric_sql("销售额")
+    units = numeric_sql("销量")
+    driver_frame = fetch_df(
+        f"""
+        SELECT COALESCE(`key_driver`, '(NULL)') AS key_driver,
+               COUNT(*) AS row_count,
+               SUM({sales}) AS sales_gmv,
+               SUM({units}) AS sales_units
+        FROM `{TABLE}`
+        GROUP BY COALESCE(`key_driver`, '(NULL)')
+        ORDER BY row_count DESC
+        """
+    )
+    counts = fetch_one(
+        f"""
+        SELECT
+          SUM(CASE WHEN `key_driver` = 'Needs review' THEN 1 ELSE 0 END) AS needs_review_rows,
+          SUM(CASE WHEN `key_driver` IS NULL THEN 1 ELSE 0 END) AS null_driver_rows,
+          SUM(CASE WHEN {invalid_any} THEN 1 ELSE 0 END) AS invalid_numeric_rows,
+          SUM({sales}) AS product_sales_gmv
+        FROM `{TABLE}`
+        """
+    )
+    invalid_counts = fetch_one(
+        "SELECT "
+        + ", ".join(
+            f"SUM(CASE WHEN {predicate} THEN 1 ELSE 0 END) AS invalid_{index}"
+            for index, predicate in enumerate(invalid_parts)
+        )
+        + f" FROM `{TABLE}`"
+    )
+    invalid_by_field = {
+        column: int(invalid_counts.get(f"invalid_{index}") or 0)
+        for index, column in enumerate(DRIVER_FIELDS)
+    }
+    blockers = {
+        "needs_review_rows": int(counts.get("needs_review_rows") or 0),
+        "null_driver_rows": int(counts.get("null_driver_rows") or 0),
+        "invalid_numeric_rows": int(counts.get("invalid_numeric_rows") or 0),
+    }
+    samples: list[dict] = []
+    if any(blockers.values()):
+        sample_frame = fetch_df(
+            f"""
+            SELECT `\u5546\u54c1ID` AS item_id, `\u5546\u54c1\u54c1\u724c` AS brand,
+                   `\u4e1a\u52a1\u65e5\u671f` AS business_date,
+                   `\u5546\u54c1\u56db\u7ea7\u5206\u7c7b` AS category, `key_driver`
+            FROM `{TABLE}`
+            WHERE `key_driver` IN ('Needs review') OR `key_driver` IS NULL OR ({invalid_any})
+            LIMIT 20
+            """
+        )
+        samples = sample_frame.to_dict(orient="records")
+    driver_records = driver_frame.to_dict(orient="records")
+    valid_driver_gmv = sum(
+        float(row.get("sales_gmv") or 0)
+        for row in driver_records
+        if row.get("key_driver") in {"Store live", "KOL live", "Video", "Product tab"}
+    )
+    product_sales_gmv = float(counts.get("product_sales_gmv") or 0)
+    return {
+        "table": TABLE,
+        "passed": not any(blockers.values()),
+        "blockers": blockers,
+        "invalid_by_field": invalid_by_field,
+        "product_sales_gmv": product_sales_gmv,
+        "valid_driver_sales_gmv": valid_driver_gmv,
+        "unassigned_or_conflicted_sales_gmv": product_sales_gmv - valid_driver_gmv,
+        "drivers": driver_records,
+        "samples": samples,
+    }
+
+
+def explain(brand: str, start: str, end: str) -> list[dict]:
+    frame = fetch_df(
+        f"""
+        EXPLAIN SELECT `key_driver`, `\u5546\u54c1\u56db\u7ea7\u5206\u7c7b`, SUM({numeric_sql('销售额')})
+        FROM `{TABLE}`
+        WHERE `\u5546\u54c1\u54c1\u724c` = :brand
+          AND `\u4e1a\u52a1\u65e5\u671f` BETWEEN :start_date AND :end_date
+        GROUP BY `key_driver`, `\u5546\u54c1\u56db\u7ea7\u5206\u7c7b`
+        """,
+        {"brand": brand, "start_date": start.replace("-", "/"), "end_date": end.replace("-", "/")},
+    )
+    return frame.to_dict(orient="records")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prepare and validate Douyin product daily V2 data.")
+    parser.add_argument("--migrate", action="store_true")
+    parser.add_argument("--quality", action="store_true")
+    parser.add_argument("--explain-brand")
+    parser.add_argument("--start")
+    parser.add_argument("--end")
+    args = parser.parse_args()
+    if not any((args.migrate, args.quality, args.explain_brand)):
+        parser.error("choose --migrate, --quality, or --explain-brand")
+    if args.migrate:
+        print(json.dumps(migrate(), ensure_ascii=False, indent=2, default=str))
+    if args.quality:
+        report = quality_report()
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        if not report["passed"]:
+            raise SystemExit(2)
+    if args.explain_brand:
+        if not args.start or not args.end:
+            parser.error("--explain-brand requires --start and --end")
+        print(json.dumps(explain(args.explain_brand, args.start, args.end), ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

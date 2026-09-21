@@ -1,8 +1,12 @@
 from __future__ import annotations
+from bot.brand_query import source_fetch, enabled as brand_gate_enabled
+
+from datetime import date
 
 import pandas as pd
 
-from bot.db.connection import fetch_df
+from bot.db.connection import fetch_df, fetch_one
+from bot.brand_source_binding import single_value
 from bot.tools.common import tool
 from bot.tools.followup_common import month_keys
 from bot.utils import safe_div, safe_evol
@@ -33,6 +37,24 @@ _CHANNEL_RULES = {
 }
 
 _AIT_ORDER = ["Awareness", "Influencer", "Transaction"]
+
+
+def latest_media_investment_month(brand: str, year: int) -> str | None:
+    """Return the latest Topline month available for a brand and data year."""
+    try:
+        if not brand_gate_enabled():brand = single_value(brand, "ai_bot_media_topline_investment")
+        row = source_fetch(fetch_one,'ai_bot_media_topline_investment','brand_r','brand_r = :brand',
+            """
+            SELECT MAX(CAST(period_month AS DATE)) AS latest_month
+            FROM ai_bot_media_topline_investment
+            WHERE brand_r = :brand AND year = :year
+            """,
+            {"brand": brand, "year": year},
+        )
+    except Exception:
+        return None
+    value = row.get("latest_month")
+    return str(value)[:10] if value else None
 
 
 def _comparison_status(current_rows: int, prior_rows: int, prior_value: float) -> str:
@@ -212,9 +234,10 @@ def query_media_investment(
 ) -> dict:
     """查询TTL、AIT、交易平台花费及Overall/RED/Douyin BKFS结构。"""
     try:
+        if not brand_gate_enabled():brand = single_value(brand, "ai_bot_media_topline_investment")
         current_year = int(str(focus_start)[:4])
         prior_year = int(str(prior_start)[:4])
-        df = fetch_df(
+        df = source_fetch(fetch_df,'ai_bot_media_topline_investment','brand_r','brand_r = :brand',
             """
             SELECT
                 year,
@@ -270,6 +293,37 @@ def query_media_investment(
             month for month in requested_months if month not in current_months
         ]
         if missing_current_months:
+            latest_current = current_months[-1] if current_months else None
+            trailing_missing = bool(latest_current) and all(
+                month > latest_current for month in missing_current_months
+            )
+            if trailing_missing:
+                effective_focus_end = pd.Period(latest_current, freq="M").end_time.date().isoformat()
+                effective_prior_end = date(
+                    prior_year,
+                    int(latest_current[-2:]),
+                    pd.Period(f"{prior_year}-{latest_current[-2:]}", freq="M").days_in_month,
+                ).isoformat()
+                period_dates = df["period_month"].dt.date
+                current_mask = (
+                    (df["year"] == current_year)
+                    & (period_dates >= date.fromisoformat(focus_start))
+                    & (period_dates <= date.fromisoformat(effective_focus_end))
+                )
+                prior_mask = (
+                    (df["year"] == prior_year)
+                    & (period_dates >= date.fromisoformat(prior_start))
+                    & (period_dates <= date.fromisoformat(effective_prior_end))
+                )
+                df = df.loc[current_mask | prior_mask].copy()
+            else:
+                effective_focus_end = None
+                effective_prior_end = None
+        else:
+            trailing_missing = False
+            effective_focus_end = None
+            effective_prior_end = None
+        if missing_current_months and not trailing_missing:
             missing_text = "、".join(f"{int(month[-2:])}月" for month in missing_current_months)
             latest_text = (
                 f"，当前最新可用月份为{int(current_months[-1][-2:])}月"
@@ -304,6 +358,8 @@ def query_media_investment(
             for channel in ("tmall", "douyin", "jd")
         }
         return {
+            "business_category": "TTL",
+            "scope_note": "品牌整体BET，不按电商品类拆分",
             "brand": brand,
             "matched_brand": brand,
             "date_range": {
@@ -333,6 +389,11 @@ def query_media_investment(
             "coverage": {
                 "requested_months": requested_months,
                 "current_months": current_months,
+                "missing_current_months": missing_current_months,
+                "period_adjusted": trailing_missing,
+                "requested_focus_end": focus_end,
+                "effective_focus_end": effective_focus_end or focus_end,
+                "effective_prior_end": effective_prior_end or prior_end,
                 "prior_months": sorted(
                     df.loc[df["year"] == prior_year, "period_month"].dt.strftime("%Y-%m").unique().tolist()
                 ),

@@ -334,9 +334,9 @@ class EcRouteTest(unittest.TestCase):
             confidence="high",
         )
         result = route("分析珀莱雅的生意", SessionState())
-        self.assertEqual(result.type, "clarify_period")
+        self.assertEqual(result.type, "clarify_ec_platform")
         self.assertEqual(result.brand, "珀莱雅")
-        self.assertEqual(result.brand_aliases, ["珀莱雅", "PROYA"])
+        self.assertEqual(result.brand_aliases, ["珀莱雅"])
 
     def test_period_reply_resumes_pending_request(self):
         state = SessionState(pending_request={
@@ -349,6 +349,64 @@ class EcRouteTest(unittest.TestCase):
         self.assertEqual(result.brand, "珀莱雅")
         self.assertEqual(result.brand_aliases, ["珀莱雅", "PROYA"])
         self.assertEqual(result.period, "2026年7月1日到7月19日")
+
+
+class EcQuantityPhrasingBrandExtractionTest(unittest.TestCase):
+    """"是多少/多少钱"这类数值型问法此前会让品牌名带着残留尾巴进入下游查询
+    （例如brand="欧莱雅在"或"珀莱雅卖了"），跟"怎么样/如何"描述型问法享受
+    不到同等的正则覆盖。这里锁定修复后的行为，防止回归。"""
+
+    @patch("bot.router.classify_user_intent", return_value=None)
+    def test_quantity_question_does_not_pollute_brand_with_trailing_connector(self, _classify):
+        result = route("欧莱雅8月20日在天猫的生意是多少", SessionState())
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(result.brand, "欧莱雅")
+        self.assertEqual(result.period, "8月20日")
+
+    @patch("bot.router.classify_user_intent", return_value=None)
+    def test_verb_plus_quantity_phrasing_does_not_pollute_brand(self, _classify):
+        result = route("珀莱雅天猫卖了多少钱", SessionState())
+        self.assertEqual(result.brand, "珀莱雅")
+
+    @patch("bot.router.classify_user_intent", return_value=None)
+    def test_campaign_literal_is_stripped_from_brand_not_just_period(self, _classify):
+        result = route("谷雨天猫618怎么样", SessionState())
+        self.assertEqual(result.type, "default_chain")
+        self.assertEqual(result.brand, "谷雨")
+        self.assertEqual(result.period, "618")
+
+    @patch("bot.router.classify_user_intent", return_value=None)
+    def test_full_month_day_range_on_both_sides_does_not_leak_into_brand(self, _classify):
+        result = route("珀莱雅2026年5月1日至5月20日在天猫的生意是多少", SessionState())
+        self.assertEqual(result.brand, "珀莱雅")
+        self.assertEqual(result.period, "2026年5月1日至5月20日")
+
+    def test_campaign_literal_with_casual_closing_verb_does_not_pollute_brand(self):
+        # detect_brand_hint's smart split-based branch doesn't cover "咋样"
+        # or a bare "期间" connector; broadening it to catch relative days
+        # ("昨天") without excluding campaign literals regressed inputs like
+        # "林清轩618咋样", which the marker-loop branch already handled
+        # correctly by trying the "before" substring first.
+        from bot.utils import detect_brand_hint
+        for raw, expected in (
+            ("林清轩618咋样", "林清轩"),
+            ("林清轩618期间的生意如何", "林清轩"),
+            ("分析一下618期间谷雨的生意", "谷雨"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(detect_brand_hint(raw), expected)
+
+    def test_store_suffix_and_relative_day_do_not_pollute_fallback_brand_hint(self):
+        # detect_brand_hint's smart split-based branch only fired for
+        # month-shaped periods, so a relative day like "昨天" (which has no
+        # "月" in it) fell through to a crude greedy catch-all that grabbed
+        # everything up to "的生意" — including a store-type suffix like
+        # "官方旗舰店" that sits between the brand and the period.
+        from bot.utils import detect_brand_hint
+        self.assertEqual(
+            detect_brand_hint("分析一下欧莱雅官方旗舰店昨天的生意表现，找出机会点"),
+            "欧莱雅",
+        )
 
 
 class EcDriverTest(unittest.TestCase):
@@ -427,11 +485,11 @@ class EcDefaultChainBrandTest(unittest.TestCase):
 
 
 class EcipTmallGmvTest(unittest.TestCase):
-    def test_monthly_table_storage_restores_business_month(self):
-        from bot.tools.market_common import monthly_business_date_sql
-        expression = monthly_business_date_sql("bus_date")
-        self.assertIn("LPAD(DAY(bus_date)", expression)
-        self.assertIn("STR_TO_DATE", expression)
+    def test_store_rank_monthly_table_uses_normal_calendar_date(self):
+        from bot.tools.market_common import store_rank_monthly_date_sql
+        expression = store_rank_monthly_date_sql("bus_date")
+        self.assertEqual(expression, "CAST(bus_date AS DATE)")
+        self.assertNotIn("DAY(bus_date)", expression)
 
     @patch("bot.tools.query_ecip_tmall_gmv.fetch_df")
     @patch("bot.tools.query_ecip_tmall_gmv.ec_query_context")
@@ -469,15 +527,23 @@ class EcipTmallGmvTest(unittest.TestCase):
         daily_sql = fetch_df.call_args_list[1].args[0]
         params = fetch_df.call_args_list[1].args[1]
         self.assertIn("three_platform_store_rank_monthly", monthly_sql)
-        self.assertIn("LPAD(DAY(bus_date)", monthly_sql)
-        self.assertIn("UPPER(TRIM(platform)) IN ('TM', 'TMALL')", monthly_sql)
+        self.assertIn("CAST(bus_date AS DATE)", monthly_sql)
+        self.assertNotIn("LPAD(DAY(bus_date)", monthly_sql)
+        self.assertIn("UPPER(TRIM(platform)) IN ('TM', 'TMALL', '天猫')", monthly_sql)
+        self.assertIn("category_EN_level_1", monthly_sql)
+        self.assertIn("'skincare'", monthly_sql)
+        self.assertIn("'hair'", monthly_sql)
+        self.assertIn("'makeup (exclude fragrance)'", monthly_sql)
+        self.assertNotIn("= 'fragrance'", monthly_sql)
         self.assertIn("tmall_store_ranking_day_jiashicang", daily_sql)
-        for sql in (monthly_sql, daily_sql):
+        self.assertNotIn("category_EN_level_1 IN", monthly_sql)
+        for sql in (daily_sql,):
             self.assertIn("category_EN_level_1", sql)
-            self.assertIn("'Skincare'", sql)
-            self.assertIn("'Hair'", sql)
-            self.assertIn("'Makeup + Fragrance'", sql)
-            self.assertNotIn("'Fragrance'", sql)
+            self.assertIn("'skincare'", sql)
+            self.assertIn("'hair'", sql)
+            self.assertIn("'makeup + fragrance'", sql)
+            self.assertIn("'makeup (exclude fragrance)'", sql)
+            self.assertNotIn("= 'fragrance'", sql)
         self.assertEqual(params["current_start_iso"], "2026-07-01")
         self.assertEqual(params["prior_start_iso"], "2025-07-01")
         self.assertNotIn("current_start_slash", params)

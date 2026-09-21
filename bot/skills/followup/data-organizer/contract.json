@@ -40,6 +40,12 @@
     "fee_ratio": ["actual", "change_pp"],
     "cpe": ["actual"]
   },
-  "tools": ["query_ec_followup_table", "query_bet_followup_table", "query_ec_bet_monthly"],
+  "tools": ["query_ec_followup_table", "query_douyin_followup_table", "query_bet_followup_table", "query_ec_bet_monthly"],
+  "platform_capabilities": {
+    "TM": ["month", "category", "key_driver", "series", "sku"],
+    "DY": ["category", "key_driver", "series", "sku"],
+    "JD": ["category"],
+    "TTL": ["platform"]
+  },
   "output": {"max_inline_rows": 20, "insights": false, "evidence_required": true}
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bot.db.connection import fetch_df
+from bot.failures import StructuredAnalysisError, failure_result, infrastructure_failure
 from bot.tools.common import ec_query_context, tool
 from bot.tools.ecip_ttl_gmv_blend import query_blended_tmall_ttl_gmv
 from bot.utils import safe_evol
@@ -8,9 +9,8 @@ from bot.utils import safe_evol
 
 _TTL_CATEGORY_VALUES = (
     "Skincare",
+    "Makeup",
     "Hair",
-    "Makeup + Fragrance",
-    "Makeup+Fragrance",
 )
 
 
@@ -22,7 +22,13 @@ def query_ecip_tmall_gmv(
 ) -> dict:
     """Query ECIP MASS Pure Mass Market Ranking (TTL Beauty) Tmall TTL GMV."""
     try:
-        context = ec_query_context(brand, period, brand_aliases=brand_aliases)
+        from bot.brand_query import enabled
+        if enabled():
+            from bot.utils import parse_ec_period
+            from datetime import date
+            context={**parse_ec_period(period,date.today().year),'input_brand':brand,'source_brand':brand}
+        else:
+            context = ec_query_context(brand, period, brand_aliases=brand_aliases)
         blended = query_blended_tmall_ttl_gmv(
             fetch_df,
             brand=context["source_brand"],
@@ -39,7 +45,7 @@ def query_ecip_tmall_gmv(
                 "message": (
                     f"品牌“{context['source_brand']}”在ECIP MASS Pure Mass Market "
                     "Ranking (TTL Beauty)本期没有"
-                    "Skincare、Hair或Makeup + Fragrance数据，报告未生成。"
+                    "Skincare、Makeup或Hair数据，报告未生成。"
                 ),
             }
         if prior["row_count"] == 0:
@@ -48,7 +54,7 @@ def query_ecip_tmall_gmv(
                 "message": (
                     f"品牌“{context['source_brand']}”在ECIP MASS Pure Mass Market "
                     "Ranking (TTL Beauty)去年同期没有"
-                    "Skincare、Hair或Makeup + Fragrance数据，报告未生成。"
+                    "Skincare、Makeup或Hair数据，报告未生成。"
                 ),
             }
         return {
@@ -67,5 +73,7 @@ def query_ecip_tmall_gmv(
                 "evol": safe_evol(current["gmv"], prior["gmv"]),
             },
         }
+    except StructuredAnalysisError as exc:
+        return failure_result(exc.failure)
     except Exception as exc:
-        return {"error": "execution_error", "message": str(exc)}
+        return failure_result(infrastructure_failure(exc, requested_period=str(period)))

@@ -1,27 +1,44 @@
 from __future__ import annotations
+from bot.store_report_scope import amount_sql as store_amount, monthly_category_sql
 
 import json
+import logging
+import os
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 
 from bot.db.connection import fetch_df, fetch_one
-from bot.media_brand import resolve_source_brand
+from bot.failures import (
+    AnalysisFailure, INVALID_PERIOD, data_coverage_failure,
+    failure_result, infrastructure_failure,
+)
+from bot.media_brand import configured_brand_alias, generate_brand_variants, resolve_source_brand
+from bot.period_coverage import normalize_period_to_latest
+from bot.platforms import platform_filter_sql
 from bot.tools.common import tool
-from bot.tools.market_common import month_slices, monthly_business_date_sql
-from bot.utils import extract_json_object, llm_client, parse_ec_period, safe_div, safe_evol
+from bot.tools.market_common import (
+    month_slices,
+    store_rank_business_category_sql,
+    store_rank_core_category_sql,
+    store_rank_monthly_date_sql,
+)
+from bot.utils import extract_json_object, llm_client, llm_model, parse_ec_period, safe_div, safe_evol
 
 
 S2_DAILY_TABLE = "dy_store_ranking_BFSS_day_jiashicang"
 S2_MONTHLY_TABLE = "three_platform_store_rank_monthly"
-S4_PRODUCT_TABLE = "dy_goodssales_rank_day_jiashicang"
+S4_PRODUCT_TABLE = "ai_bot_dy_product_link"
+log = logging.getLogger(__name__)
 
 CHANNELS = (
     ("kol_live", "KOL直播", "kol_gmv"),
     ("store_live", "品牌自营直播", "storelive_gmv"),
     ("short_other", "短视频及其他", "short_other_gmv"),
 )
+PRODUCT_DRIVERS = ("Store live", "Kol live", "Video", "Product tab")
 
 _SERIES_PATH = Path(__file__).resolve().parents[1] / "data" / "series_map.json"
 
@@ -31,6 +48,61 @@ def _amount_sql(column: str) -> str:
         "COALESCE(CAST(REPLACE(NULLIF(TRIM(" + column + "), ''), ',', '') "
         "AS DECIMAL(24,4)), 0)"
     )
+
+
+def _daily_ttl_beauty_sql(column: str = "category_EN_level_1") -> str:
+    """Daily-store TTL Beauty scope: Skincare + Makeup + Hair."""
+    return store_rank_business_category_sql(
+        "TOTAL BEAUTY", column, "category_EN_level_2",
+    )
+
+
+def _enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _llm_pipeline_enabled() -> bool:
+    return not _enabled("LEGACY_PIPELINE_EMERGENCY")
+
+
+def _mapped_query(fetcher, table, sql, params):
+    from bot.brand_query import enabled,apply_brand_predicate,require_platform
+    if enabled():
+        require_platform('DY')
+        product=table==S4_PRODUCT_TABLE
+        sql,params,_=apply_brand_predicate(sql,params,brand=params['brand'],table=table,
+            field='商品品牌' if product else 'brand_name',
+            predicate='`商品品牌` = :brand' if product else 'TRIM(brand_name) = :brand')
+    return fetcher(sql,params)
+
+
+def _mapped_fetch_df(table,sql,params):return _mapped_query(fetch_df,table,sql,params)
+
+def _mapped_fetch_one(table,sql,params):return _mapped_query(fetch_one,table,sql,params)
+
+
+def _latest_required_date(brand: str, *, include_product: bool) -> str | None:
+    try:
+        values: list[str] = []
+        store = _mapped_fetch_one(S2_DAILY_TABLE,
+            f"SELECT MAX(CAST(bus_date AS DATE)) AS max_date FROM {S2_DAILY_TABLE} "
+            "WHERE TRIM(brand_name) = :brand",
+            {"brand": brand},
+        ).get("max_date")
+        if store:
+            values.append(str(store)[:10])
+        if include_product:
+            product = _mapped_fetch_one(S4_PRODUCT_TABLE,
+                f"SELECT MAX(`业务日期`) AS max_date FROM {S4_PRODUCT_TABLE} "
+                "WHERE `商品品牌` = :brand AND NULLIF(TRIM(`商品四级分类`), '') IS NOT NULL",
+                {"brand": brand},
+            ).get("max_date")
+            if product:
+                values.append(str(product)[:10])
+        return min(values) if values else None
+    except Exception:
+        log.warning("[douyin_business] latest-date lookup failed", exc_info=True)
+        return None
 
 
 def _source_slices(start: str, end: str) -> list[dict]:
@@ -43,6 +115,55 @@ def _source_slices(start: str, end: str) -> list[dict]:
         }
         for item in month_slices(start, end)
     ]
+
+
+def _batched_source_slices(
+    brand: str,
+    period_meta: dict,
+    monthly_brand: str | None,
+    daily_brand: str | None = None,
+) -> dict[str, dict]:
+    groups: dict[str, dict] = {}
+    for period_key, start_key, end_key in (
+        ("current", "current_start", "current_end"),
+        ("prior", "prior_start", "prior_end"),
+    ):
+        for item in _source_slices(period_meta[start_key], period_meta[end_key]):
+            source = item["source"]
+            group = groups.setdefault(source, {
+                "source": source, "table": item["table"], "items": [],
+                "brand": (
+                    monthly_brand if source == "monthly" and monthly_brand
+                    else daily_brand if source == "daily" and daily_brand
+                    else brand
+                ),
+            })
+            group["items"].append({**item, "period_key": period_key})
+    return groups
+
+
+def _batch_period_sql(items: list[dict], business_date: str) -> tuple[str, str, str, dict]:
+    period_cases = []
+    month_cases = []
+    predicates = []
+    params = {}
+    for index, item in enumerate(items):
+        start_key, end_key = f"batch_start_{index}", f"batch_end_{index}"
+        period_key, month_key = f"batch_period_{index}", f"batch_month_{index}"
+        predicate = f"{business_date} BETWEEN :{start_key} AND :{end_key}"
+        predicates.append(predicate)
+        period_cases.append(f"WHEN {predicate} THEN :{period_key}")
+        month_cases.append(f"WHEN {predicate} THEN :{month_key}")
+        params.update({
+            start_key: item["start"], end_key: item["end"],
+            period_key: item["period_key"], month_key: item["month"],
+        })
+    return (
+        "CASE " + " ".join(period_cases) + " END",
+        "CASE " + " ".join(month_cases) + " END",
+        "(" + " OR ".join(predicates) + ")",
+        params,
+    )
 
 
 def _load_known_series(brand_candidates: Iterable[str]) -> list[tuple[str, str]]:
@@ -86,7 +207,8 @@ def _infer_series_mapping(
         else:
             unmatched.append(title)
 
-    # Product names can be numerous. Small deterministic batches keep the JSON response valid.
+    # Product names can be numerous. The caller passes a GMV-ranked bounded set
+    # so an unknown brand cannot trigger dozens of serial model requests.
     for offset in range(0, len(unmatched), 60):
         batch = unmatched[offset:offset + 60]
         prompt = f"""
@@ -99,14 +221,13 @@ def _infer_series_mapping(
 """
         try:
             response = llm_client(max_retries=1).chat.completions.create(
-                model="qwen-plus-latest",
+                model=llm_model("summary"),
                 messages=[
                     {"role": "system", "content": "你是严格的电商产品系列归类器，只返回JSON。"},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0,
                 max_tokens=3000,
-                timeout=30,
+                timeout=float(os.environ.get("DOUYIN_SERIES_LLM_TIMEOUT", "12")),
                 response_format={"type": "json_object"},
                 extra_body={"enable_thinking": False},
             )
@@ -127,117 +248,344 @@ def _infer_series_mapping(
 def _query_s2_categories(
     brand: str,
     period_meta: dict,
+    *,
+    monthly_brand: str | None = None,
+    daily_brand: str | None = None,
 ) -> tuple[pd.DataFrame, list[dict], list[dict]]:
     frames: list[pd.DataFrame] = []
     sources: list[dict] = []
     missing: list[dict] = []
-    for period_key, start_key, end_key in (
-        ("current", "current_start", "current_end"),
-        ("prior", "prior_start", "prior_end"),
-    ):
-        for item in _source_slices(period_meta[start_key], period_meta[end_key]):
-            table = item["table"]
-            platform_clause = "AND UPPER(TRIM(platform)) = 'DY'" if item["source"] == "monthly" else ""
-            business_date = (
-                monthly_business_date_sql("bus_date")
-                if item["source"] == "monthly"
-                else "CAST(bus_date AS DATE)"
-            )
-            sql = f"""
-                SELECT
-                  :period_key AS period_key,
-                  COALESCE(NULLIF(TRIM(category_level_4), ''), '未分类') AS category_level_4,
-                  SUM({_amount_sql('gmv')}) AS gmv,
-                  COUNT(*) AS row_count
-                FROM {table}
-                WHERE TRIM(brand_name) = :brand
-                  {platform_clause}
-                  AND {business_date} BETWEEN :slice_start AND :slice_end
-                GROUP BY COALESCE(NULLIF(TRIM(category_level_4), ''), '未分类')
-            """
-            frame = fetch_df(sql, {
-                "period_key": period_key,
-                "brand": brand,
-                "slice_start": item["start"],
-                "slice_end": item["end"],
-            })
+    from bot.brand_query import enabled,validate_query_dates
+    if enabled():validate_query_dates(period_meta)
+    groups = _batched_source_slices(brand, period_meta, monthly_brand, daily_brand)
+    for source, group in groups.items():
+        table = group["table"]
+        table = group["table"]
+        query_brand = group["brand"]
+        platform_clause = "AND " + platform_filter_sql(S2_MONTHLY_TABLE, "DY") if source == "monthly" else ""
+        business_date = store_rank_monthly_date_sql("bus_date") if source == "monthly" else "CAST(bus_date AS DATE)"
+        period_case, month_case, range_clause, params = _batch_period_sql(group["items"], business_date)
+        # Monthly sources expose only English L1/L2; keep product drilldown separate.
+        category_column = "category_EN_level_1" if source == "monthly" else "category_level_4"
+        if source == "monthly":
+                # Import batches can repeat the same monthly business row.
+                # Deduplicate on the confirmed monthly business key before
+                # summing so a brand total cannot be doubled by re-imports.
+                sql = f"""
+                    SELECT
+                      {period_case} AS period_key,
+                      {month_case} AS source_month,
+                      'monthly' AS source_name,
+                      {monthly_category_sql()} AS category_level_4,
+                      SUM({store_amount('gmv','DY')}) AS gmv,
+                      COUNT(*) AS row_count
+                    FROM (
+                      SELECT bus_date, category_EN_level_1,
+                             category_EN_level_2, store_id, store_CN, brand_name,
+                             SELECTIVITY, platform,
+                             MAX({_amount_sql('gmv')}) AS gmv
+                      FROM {table}
+                      WHERE TRIM(brand_name) = :brand
+                        {platform_clause}
+                        AND {store_rank_core_category_sql()}
+                        AND {range_clause}
+                      GROUP BY bus_date, category_EN_level_1,
+                               category_EN_level_2, store_id, store_CN, brand_name,
+                               SELECTIVITY, platform
+                    ) monthly_dedup
+                    GROUP BY period_key, source_month,
+                             {monthly_category_sql()}
+                """
+        else:
+                sql = f"""
+                    SELECT
+                      {period_case} AS period_key,
+                      {month_case} AS source_month,
+                      'daily' AS source_name,
+                      COALESCE(NULLIF(TRIM({category_column}), ''), '未分类') AS category_level_4,
+                      SUM({store_amount(_amount_sql('gmv'),'DY')}) AS gmv,
+                      COUNT(*) AS row_count
+                    FROM {table}
+                    WHERE TRIM(brand_name) = :brand
+                      AND {_daily_ttl_beauty_sql()}
+                      AND {range_clause}
+                    GROUP BY period_key, source_month,
+                             COALESCE(NULLIF(TRIM({category_column}), ''), '未分类')
+                """
+        frame = _mapped_fetch_df(table,sql, {"brand": query_brand, **params})
+        if not frame.empty:
+            frames.append(frame)
+
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    present = set()
+    if not combined.empty:
+        present = {
+            (str(row["period_key"]), str(row["source_month"]), str(row["source_name"]))
+            for _, row in combined[["period_key", "source_month", "source_name"]].drop_duplicates().iterrows()
+        }
+    for group in groups.values():
+        for item in group["items"]:
             source_row = {
-                "period": period_key,
+                "period": item["period_key"],
                 "month": item["month"],
-                "source": item["source"],
-                "table": table,
+                "source": group["source"],
+                "table": group["table"],
                 "start": item["start"],
                 "end": item["end"],
             }
             sources.append(source_row)
-            if frame.empty:
+            if (item["period_key"], item["month"], group["source"]) not in present:
                 missing.append(source_row)
-            else:
-                frames.append(frame)
+    return combined, sources, missing
+
+
+def _query_s2_channels(
+    brand: str,
+    period_meta: dict,
+    *,
+    monthly_brand: str | None = None,
+    daily_brand: str | None = None,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    from bot.brand_query import enabled,validate_query_dates
+    if enabled():validate_query_dates(period_meta)
+    for source, group in _batched_source_slices(
+        brand, period_meta, monthly_brand, daily_brand
+    ).items():
+        table = group["table"]
+        query_brand = group["brand"]
+        business_date = store_rank_monthly_date_sql("bus_date") if source == "monthly" else "CAST(bus_date AS DATE)"
+        period_case, month_case, range_clause, params = _batch_period_sql(group["items"], business_date)
+        if source == "monthly":
+                sql = f"""
+                    SELECT {period_case} AS period_key,
+                           {month_case} AS source_month,
+                           SUM({store_amount('gmv','DY')}) AS brand_gmv,
+                           SUM({store_amount('kol_gmv','DY')}) AS kol_gmv,
+                           SUM({store_amount('storelive_gmv','DY')}) AS storelive_gmv,
+                           COUNT(*) AS row_count
+                    FROM (
+                      SELECT bus_date, category_EN_level_1,
+                             category_EN_level_2, store_id, store_CN, brand_name,
+                             SELECTIVITY, platform,
+                             MAX({_amount_sql('gmv')}) AS gmv,
+                             MAX({_amount_sql('kol_gmv')}) AS kol_gmv,
+                             MAX({_amount_sql('storelive_gmv')}) AS storelive_gmv
+                      FROM {S2_MONTHLY_TABLE}
+                      WHERE TRIM(brand_name) = :brand
+                        AND {platform_filter_sql(S2_MONTHLY_TABLE, 'DY')}
+                        AND {store_rank_core_category_sql()}
+                        AND {range_clause}
+                      GROUP BY bus_date, category_EN_level_1,
+                               category_EN_level_2, store_id, store_CN, brand_name,
+                               SELECTIVITY, platform
+                    ) monthly_dedup
+                    GROUP BY period_key, source_month
+                """
+        else:
+                sql = f"""
+                    SELECT {period_case} AS period_key,
+                           {month_case} AS source_month,
+                           SUM({store_amount(_amount_sql('gmv'),'DY')}) AS brand_gmv,
+                           SUM({store_amount(_amount_sql('KOL_gmv'),'DY')}) AS kol_gmv,
+                           SUM({store_amount(_amount_sql('storelive_gmv'),'DY')}) AS storelive_gmv,
+                           COUNT(*) AS row_count
+                    FROM {S2_DAILY_TABLE}
+                    WHERE TRIM(brand_name) = :brand
+                      AND {_daily_ttl_beauty_sql()}
+                      AND {range_clause}
+                    GROUP BY period_key, source_month
+                """
+        frame = _mapped_fetch_df(table,sql, {"brand": query_brand, **params})
+        if not frame.empty:
+            frames.append(frame)
     if not frames:
-        return pd.DataFrame(), sources, missing
-    return pd.concat(frames, ignore_index=True), sources, missing
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.groupby("period_key", as_index=False)[
+        ["brand_gmv", "kol_gmv", "storelive_gmv", "row_count"]
+    ].sum()
 
 
-def _query_s2_channels(brand: str, period_meta: dict) -> pd.DataFrame:
-    gmv = _amount_sql("gmv")
-    kol = _amount_sql("KOL_gmv")
-    store = _amount_sql("storelive_gmv")
-    return fetch_df(
-        f"""
-        SELECT
-          CASE
-            WHEN CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end THEN 'current'
-            ELSE 'prior'
-          END AS period_key,
-          SUM({gmv}) AS brand_gmv,
-          SUM({kol}) AS kol_gmv,
-          SUM({store}) AS storelive_gmv,
-          COUNT(*) AS row_count
-        FROM {S2_DAILY_TABLE}
-        WHERE TRIM(brand_name) = :brand
-          AND (
-            CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
-            OR CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
-          )
-        GROUP BY period_key
-        """,
-        {"brand": brand, **{key: period_meta[key] for key in (
-            "current_start", "current_end", "prior_start", "prior_end"
-        )}},
+def _resolve_s2_monthly_brand(
+    user_brand: str,
+    resolved_brand: str,
+    period_meta: dict,
+    brand_aliases: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    from bot.brand_query import enabled
+    if enabled():return user_brand
+    """Validate the brand against the monthly fact table's own spelling."""
+    configured = configured_brand_alias(user_brand, S2_MONTHLY_TABLE)
+    if configured:
+        log.info(
+            "[douyin_business] using configured monthly brand user_brand=%s monthly_brand=%s",
+            user_brand, configured,
+        )
+        return configured
+    candidates = list(dict.fromkeys(
+        cleaned
+        for value in (
+            resolved_brand,
+            user_brand,
+            *(brand_aliases or ()),
+            *generate_brand_variants(user_brand),
+        )
+        if (cleaned := str(value or "").strip())
+    ))
+    if not candidates:
+        return resolved_brand
+    params = {f"brand_{index}": value for index, value in enumerate(candidates)}
+    placeholders = ", ".join(f":brand_{index}" for index in range(len(candidates)))
+    params.update({
+        "current_start": period_meta["current_start"],
+        "current_end": period_meta["current_end"],
+        "prior_start": period_meta["prior_start"],
+        "prior_end": period_meta["prior_end"],
+    })
+    try:
+        frame = fetch_df(
+            f"""
+            SELECT DISTINCT TRIM(brand_name) AS source_brand
+            FROM {S2_MONTHLY_TABLE}
+            WHERE TRIM(brand_name) IN ({placeholders})
+              AND {platform_filter_sql(S2_MONTHLY_TABLE, 'DY')}
+              AND {store_rank_core_category_sql()}
+              AND (
+                {store_rank_monthly_date_sql('bus_date')} BETWEEN :current_start AND :current_end
+                OR {store_rank_monthly_date_sql('bus_date')} BETWEEN :prior_start AND :prior_end
+              )
+            ORDER BY source_brand
+            """,
+            params,
+        )
+    except Exception:
+        log.exception("[douyin_business] monthly brand validation failed")
+        return resolved_brand
+    if frame.empty or "source_brand" not in frame.columns:
+        log.warning(
+            "[douyin_business] monthly brand not found user_brand=%s resolved_brand=%s candidates=%s",
+            user_brand, resolved_brand, candidates,
+        )
+        return resolved_brand
+    matches = [str(value).strip() for value in frame["source_brand"].dropna() if str(value).strip()]
+    if resolved_brand in matches:
+        return resolved_brand
+    if len(matches) == 1:
+        log.info(
+            "[douyin_business] monthly brand remapped user_brand=%s resolved_brand=%s monthly_brand=%s",
+            user_brand, resolved_brand, matches[0],
+        )
+        return matches[0]
+    log.warning(
+        "[douyin_business] monthly brand ambiguous user_brand=%s resolved_brand=%s matches=%s",
+        user_brand, resolved_brand, matches,
     )
+    return resolved_brand
+
+
+def _resolve_s2_daily_brand(
+    user_brand: str,
+    resolved_brand: str,
+    period_meta: dict,
+    brand_aliases: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    from bot.brand_query import enabled
+    if enabled():return user_brand
+    """Resolve the dedicated daily store table's exact brand spelling."""
+    configured = configured_brand_alias(user_brand, S2_DAILY_TABLE)
+    if configured:
+        return configured
+    candidates = list(dict.fromkeys(
+        cleaned
+        for value in (
+            resolved_brand,
+            user_brand,
+            *(brand_aliases or ()),
+            *generate_brand_variants(user_brand),
+        )
+        if (cleaned := str(value or "").strip())
+    ))
+    if not candidates:
+        return resolved_brand
+    params = {f"brand_{index}": value for index, value in enumerate(candidates)}
+    placeholders = ", ".join(f":brand_{index}" for index in range(len(candidates)))
+    params.update({
+        "current_start": period_meta["current_start"],
+        "current_end": period_meta["current_end"],
+        "prior_start": period_meta["prior_start"],
+        "prior_end": period_meta["prior_end"],
+    })
+    try:
+        frame = fetch_df(
+            f"""
+            SELECT DISTINCT TRIM(brand_name) AS source_brand
+            FROM {S2_DAILY_TABLE}
+            WHERE TRIM(brand_name) IN ({placeholders})
+              AND {_daily_ttl_beauty_sql()}
+              AND (
+                CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
+                OR CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
+              )
+            ORDER BY source_brand
+            """,
+            params,
+        )
+    except Exception:
+        log.exception("[douyin_business] daily brand validation failed")
+        return resolved_brand
+    if frame.empty or "source_brand" not in frame.columns:
+        return resolved_brand
+    matches = [str(value).strip() for value in frame["source_brand"].dropna() if str(value).strip()]
+    if resolved_brand in matches:
+        return resolved_brand
+    if len(matches) == 1:
+        log.info(
+            "[douyin_business] daily brand remapped user_brand=%s resolved_brand=%s daily_brand=%s",
+            user_brand, resolved_brand, matches[0],
+        )
+        return matches[0]
+    return resolved_brand
 
 
 def _query_s4_products(brand: str, period_meta: dict) -> pd.DataFrame:
+    # ai_bot_dy_product_link already owns key_driver. Its 销售额 remains
+    # VARCHAR, so normalize it only in the SELECT aggregate; brand and DATE
+    # predicates stay function-free and can use idx_dy_brand_date.
     sales = _amount_sql("`销售额`")
-    kol = _amount_sql("`达人推广直播GMV`")
-    store = _amount_sql("`品牌自营直播GMV`")
-    return fetch_df(
+    date_params = {
+        key: str(period_meta[key])
+        for key in ("current_start", "current_end", "prior_start", "prior_end")
+    }
+    return _mapped_fetch_df(S4_PRODUCT_TABLE,
         f"""
         SELECT
           CASE
-            WHEN CAST(`业务日期` AS DATE) BETWEEN :current_start AND :current_end THEN 'current'
+            WHEN `业务日期` BETWEEN :current_start AND :current_end THEN 'current'
             ELSE 'prior'
           END AS period_key,
           CAST(`商品ID` AS CHAR) AS item_id,
-          MAX(TRIM(`商品名称`)) AS product_name,
-          MAX(TRIM(`商品url`)) AS product_url,
-          MAX(COALESCE(NULLIF(TRIM(`商品四级分类`), ''), '未分类')) AS category_level_4,
+          TRIM(`商品名称`) AS product_name,
+          NULL AS product_url,
+          COALESCE(NULLIF(TRIM(`商品四级分类`), ''), '未分类') AS category_level_4,
+          `key_driver`,
           SUM({sales}) AS sales_gmv,
-          SUM({kol}) AS kol_gmv,
-          SUM({store}) AS storelive_gmv,
+          0 AS kol_gmv,
+          0 AS storelive_gmv,
+          0 AS invalid_numeric_rows,
           COUNT(*) AS row_count
         FROM {S4_PRODUCT_TABLE}
-        WHERE TRIM(`商品品牌`) = :brand
+        WHERE `商品品牌` = :brand
+          AND NULLIF(TRIM(`商品四级分类`), '') IS NOT NULL
           AND (
-            CAST(`业务日期` AS DATE) BETWEEN :current_start AND :current_end
-            OR CAST(`业务日期` AS DATE) BETWEEN :prior_start AND :prior_end
+            `业务日期` BETWEEN :current_start AND :current_end
+            OR `业务日期` BETWEEN :prior_start AND :prior_end
           )
-        GROUP BY period_key, CAST(`商品ID` AS CHAR)
+        GROUP BY period_key, CAST(`商品ID` AS CHAR),
+                 COALESCE(NULLIF(TRIM(`商品四级分类`), ''), '未分类'),
+                 `key_driver`, TRIM(`商品名称`)
         """,
-        {"brand": brand, **{key: period_meta[key] for key in (
-            "current_start", "current_end", "prior_start", "prior_end"
-        )}},
+        {"brand": brand, **date_params},
     )
 
 
@@ -356,7 +704,6 @@ def _channel_overview(frame: pd.DataFrame) -> dict:
 def _product_analysis(
     frame: pd.DataFrame,
     *,
-    selected_category: str,
     brand_candidates: Iterable[str],
 ) -> dict:
     if frame.empty:
@@ -365,18 +712,27 @@ def _product_analysis(
     for column in numeric:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
     frame["short_other_gmv"] = frame["sales_gmv"] - frame["kol_gmv"] - frame["storelive_gmv"]
-    mapping = _infer_series_mapping(frame["product_name"].tolist(), brand_candidates=brand_candidates)
+    # Series labeling is descriptive enrichment only. Rank unique names by
+    # complete-period GMV and bound model work to one batch by default; all
+    # rows still participate in GMV, channel and Top-link calculations.
+    max_titles = max(0, int(os.environ.get("DOUYIN_SERIES_MAX_TITLES", "60")))
+    ranked_titles = (
+        frame.assign(product_name=frame["product_name"].fillna("").astype(str).str.strip())
+        .groupby("product_name", as_index=False)["sales_gmv"].sum()
+        .sort_values("sales_gmv", ascending=False)["product_name"]
+    )
+    ranked_titles = [title for title in ranked_titles.tolist() if title][:max_titles]
+    mapping = _infer_series_mapping(ranked_titles, brand_candidates=brand_candidates)
     frame["series"] = frame["product_name"].map(mapping).fillna("其他")
 
-    category_rows = frame[frame["category_level_4"].fillna("").str.strip() == str(selected_category).strip()]
-    category_current = float(category_rows.loc[category_rows["period_key"] == "current", "sales_gmv"].sum())
-    category_prior = float(category_rows.loc[category_rows["period_key"] == "prior", "sales_gmv"].sum())
+    brand_current = float(frame.loc[frame["period_key"] == "current", "sales_gmv"].sum())
+    brand_prior = float(frame.loc[frame["period_key"] == "prior", "sales_gmv"].sum())
     series_rows = _paired_rows(
-        category_rows,
+        frame,
         ["series"],
         "sales_gmv",
-        parent_current=category_current,
-        parent_prior=category_prior,
+        parent_current=brand_current,
+        parent_prior=brand_prior,
     )
 
     channels: dict[str, dict] = {}
@@ -409,14 +765,189 @@ def _product_analysis(
 
     return {
         "series": series_rows,
-        "category_product_total": category_current,
-        "category_product_total_prior": category_prior,
+        "brand_product_total": brand_current,
+        "brand_product_total_prior": brand_prior,
         "channels": channels,
         "series_mapping": mapping,
         "negative_short_other": bool((frame["short_other_gmv"] < -0.01).any()),
         "reconciliation": {
             "sales_current": float(frame.loc[frame["period_key"] == "current", "sales_gmv"].sum()),
             "sales_prior": float(frame.loc[frame["period_key"] == "prior", "sales_gmv"].sum()),
+        },
+    }
+
+
+def _product_analysis_v2(
+    frame: pd.DataFrame,
+    *,
+    brand_candidates: Iterable[str],
+    store_total: dict,
+) -> dict:
+    """Build category, series and driver evidence from one product-table result."""
+    if frame.empty:
+        return {
+            "quality": {"passed": False, "reason": "no_data"},
+            "product_total": {}, "categories": [], "selected_category": "",
+            "selected_category_series": [], "key_drivers": [],
+            "driver_drilldowns": [], "reconciliation": {},
+        }
+    frame = frame.copy()
+    for column in ("sales_gmv", "row_count", "invalid_numeric_rows"):
+        if column not in frame.columns:
+            frame[column] = 0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    if "key_driver" not in frame.columns:
+        frame["key_driver"] = None
+    null_driver = int(frame.loc[frame["key_driver"].isna(), "row_count"].sum())
+    invalid_numeric = int(frame["invalid_numeric_rows"].sum())
+    quality = {
+        "passed": null_driver == 0 and invalid_numeric == 0,
+        "null_driver_rows": null_driver,
+        "invalid_numeric_rows": invalid_numeric,
+    }
+
+    valid = frame[
+        frame["key_driver"].isin(PRODUCT_DRIVERS) & (frame["invalid_numeric_rows"] == 0)
+    ].copy()
+    product_current = float(valid.loc[valid["period_key"] == "current", "sales_gmv"].sum())
+    product_prior = float(valid.loc[valid["period_key"] == "prior", "sales_gmv"].sum())
+    product_total = {
+        "gmv_current": product_current,
+        "gmv_prior": product_prior,
+        "gmv_change": product_current - product_prior,
+        "evol": safe_evol(product_current, product_prior),
+    }
+
+    category_frame = valid.rename(columns={"category_level_4": "category"})
+    categories = _paired_rows(
+        category_frame, ["category"], "sales_gmv",
+        parent_current=product_current, parent_prior=product_prior,
+    )
+    # “未分类” is a source-data quality bucket, not a business category. Keep
+    # it in the reconciliation table, but never let it win a category ranking
+    # or feed a category/driver drilldown and its title interpretation.
+    classified_frame = category_frame[
+        category_frame["category"].fillna("").astype(str).str.strip().ne("未分类")
+    ].copy()
+    analysis_categories = [
+        row for row in categories if str(row.get("category") or "").strip() != "未分类"
+    ]
+    unclassified_frame = category_frame[
+        category_frame["category"].fillna("").astype(str).str.strip().eq("未分类")
+    ]
+    unclassified = {
+        "gmv_current": float(unclassified_frame.loc[
+            unclassified_frame["period_key"] == "current", "sales_gmv"
+        ].sum()),
+        "gmv_prior": float(unclassified_frame.loc[
+            unclassified_frame["period_key"] == "prior", "sales_gmv"
+        ].sum()),
+        "row_count": int(unclassified_frame["row_count"].sum()),
+    }
+    eligible = [
+        row for row in analysis_categories if float(row.get("weight") or 0) >= 0.03
+    ]
+    selected_row = max(
+        eligible,
+        key=lambda row: (float(row.get("gmv_change") or 0), float(row.get("gmv_current") or 0)),
+        default=None,
+    )
+    selected_category = str((selected_row or {}).get("category") or "")
+
+    selected_series: list[dict] = []
+    selected_category_top_links: list[dict] = []
+    series_mapping: dict[str, str] = {}
+    max_titles = max(0, int(os.environ.get("DOUYIN_SERIES_MAX_TITLES", "60")))
+    if not classified_frame.empty:
+        all_titles = (
+            classified_frame.assign(
+                product_name=classified_frame["product_name"].fillna("").astype(str).str.strip()
+            )
+            .groupby("product_name", as_index=False)["sales_gmv"].sum()
+            .sort_values("sales_gmv", ascending=False)["product_name"]
+        )
+        ranked_titles = [title for title in all_titles.tolist() if title][:max_titles]
+        series_mapping = _infer_series_mapping(ranked_titles, brand_candidates=brand_candidates)
+        classified_frame["series"] = classified_frame["product_name"].map(
+            series_mapping
+        ).fillna("其他")
+    if selected_category:
+        selected = classified_frame[classified_frame["category"] == selected_category].copy()
+        category_current = float(selected.loc[selected["period_key"] == "current", "sales_gmv"].sum())
+        category_prior = float(selected.loc[selected["period_key"] == "prior", "sales_gmv"].sum())
+        selected_series = _paired_rows(
+            selected, ["series"], "sales_gmv",
+            parent_current=category_current, parent_prior=category_prior,
+        )[:5]
+        selected_links = _paired_rows(
+            selected,
+            ["item_id", "product_name", "product_url", "category", "series"],
+            "sales_gmv",
+            parent_current=category_current,
+            parent_prior=category_prior,
+        )
+        selected_category_top_links = [
+            row for row in selected_links if row["gmv_current"] > 0
+        ][:5]
+
+    paired_drivers = _paired_rows(
+        valid, ["key_driver"], "sales_gmv",
+        parent_current=product_current, parent_prior=product_prior,
+    )
+    driver_lookup = {str(row["key_driver"]): row for row in paired_drivers}
+    key_drivers: list[dict] = []
+    driver_drilldowns: list[dict] = []
+    for driver in PRODUCT_DRIVERS:
+        driver_row = driver_lookup.get(driver, {
+            "key_driver": driver, "gmv_current": 0.0, "gmv_prior": 0.0,
+            "gmv_change": 0.0, "evol": None, "weight": 0.0,
+            "weight_prior": 0.0, "weight_change": 0.0,
+        })
+        key_drivers.append(driver_row)
+        driver_frame = classified_frame[classified_frame["key_driver"] == driver].copy()
+        driver_current = float(driver_row.get("gmv_current") or 0)
+        driver_prior = float(driver_row.get("gmv_prior") or 0)
+        driver_categories = _paired_rows(
+            driver_frame, ["category"], "sales_gmv",
+            parent_current=driver_current, parent_prior=driver_prior,
+        )
+        driver_series = _paired_rows(
+            driver_frame, ["series"], "sales_gmv",
+            parent_current=driver_current, parent_prior=driver_prior,
+        )[:5]
+        links = _paired_rows(
+            driver_frame,
+            ["item_id", "product_name", "product_url", "category", "series"],
+            "sales_gmv", parent_current=driver_current, parent_prior=driver_prior,
+        )
+        driver_drilldowns.append({
+            "key_driver": driver,
+            "top_category": driver_categories[0] if driver_categories else None,
+            "series": driver_series,
+            "top_links": [row for row in links if row["gmv_current"] > 0][:5],
+        })
+
+    store_current = float(store_total.get("gmv_current") or 0)
+    store_prior = float(store_total.get("gmv_prior") or 0)
+    return {
+        "quality": quality,
+        "product_total": product_total,
+        "categories": categories,
+        "analysis_categories": analysis_categories,
+        "unclassified": unclassified,
+        "selected_category": selected_category,
+        "selected_category_series": selected_series,
+        "selected_category_top_links": selected_category_top_links,
+        "series_mapping": series_mapping,
+        "key_drivers": key_drivers,
+        "driver_drilldowns": driver_drilldowns,
+        "reconciliation": {
+            "store_gmv_current": store_current,
+            "store_gmv_prior": store_prior,
+            "product_gmv_current": product_current,
+            "product_gmv_prior": product_prior,
+            "coverage_current": safe_div(product_current, store_current),
+            "coverage_prior": safe_div(product_prior, store_prior),
         },
     }
 
@@ -429,99 +960,235 @@ def query_douyin_business(
 ) -> dict:
     """Generate the deterministic data bundle for a Douyin brand business report."""
     try:
-        resolved = resolve_source_brand(brand, "dy", brand_aliases=brand_aliases)
+        from bot.brand_query import enabled as brand_gate_enabled
+        resolved = {'brand':brand} if brand_gate_enabled() else resolve_source_brand(brand, "dy", brand_aliases=brand_aliases)
         if resolved.get("error"):
             return resolved
         source_brand = str(resolved["brand"])
-        latest_s2 = fetch_one(
-            f"""
-            SELECT MAX(CAST(bus_date AS DATE)) AS max_date
-            FROM {S2_DAILY_TABLE}
-            WHERE TRIM(brand_name) = :brand
-            """,
-            {"brand": source_brand},
-        ).get("max_date")
-        latest_s4 = fetch_one(
-            f"""
-            SELECT MAX(CAST(`业务日期` AS DATE)) AS max_date
-            FROM {S4_PRODUCT_TABLE}
-            WHERE TRIM(`商品品牌`) = :brand
-            """,
-            {"brand": source_brand},
-        ).get("max_date")
-        latest_values = [str(value)[:10] for value in (latest_s2, latest_s4) if value]
-        if not latest_values:
-            return {"error": "no_data", "message": f"抖音数据中没有找到品牌“{brand}”。"}
-        source_max_date = min(latest_values)
-        period_meta = parse_ec_period(period, int(source_max_date[:4]))
-        if period_meta["current_end"] > source_max_date:
-            return {
-                "error": "period_after_data",
-                "message": (
-                    f"当前品牌抖音数据共同更新至{source_max_date}，"
-                    f"你指定的本期结束于{period_meta['current_end']}。"
-                ),
-            }
+        monthly_brand = source_brand
+        daily_brand = source_brand
+        # Parse first, then query the requested source directly.  A complete
+        # natural-month report must not probe either daily table merely to
+        # discover a common max date; monthly coverage below is authoritative.
+        try:
+            period_meta = parse_ec_period(period, date.today().year)
+        except ValueError as exc:
+            return failure_result(AnalysisFailure(
+                failure_kind=INVALID_PERIOD, user_message=str(exc),
+                requested_period=str(period), retry_slot="period",
+                preserved_slots=("brand", "platform", "goals"),
+            ))
+        product_v2_enabled = _enabled("DOUYIN_PRODUCT_DAILY_V2_ENABLED")
+        product_v2_shadow = _enabled("DOUYIN_PRODUCT_DAILY_V2_SHADOW")
+
+        # Topline is required; product detail is optional enrichment. Clamp a
+        # trailing not-yet-loaded slice before choosing monthly/daily sources.
+        if _llm_pipeline_enabled():
+            latest_store_date = _latest_required_date(source_brand, include_product=False)
+            if latest_store_date and period_meta["current_start"] > latest_store_date:
+                return failure_result(data_coverage_failure(
+                    brand=brand, platform_label="抖音", requested_period=period,
+                    latest_available_date=latest_store_date, after_latest=True,
+                ), error="no_data")
+            period_meta, adjustment = normalize_period_to_latest(
+                period_meta, latest_store_date,
+            )
+            if adjustment:
+                log.info(
+                    "[douyin_business] MTD coverage adjusted brand=%s requested=%s "
+                    "effective_end=%s",
+                    source_brand, period, period_meta["current_end"],
+                )
 
         category_frame, sources, missing = _query_s2_categories(source_brand, period_meta)
         if missing:
-            detail = "、".join(f"{row['period']} {row['month']}({row['source']})" for row in missing)
-            return {"error": "incomplete_coverage", "message": f"品牌/类目数据存在缺口：{detail}。"}
-        if category_frame.empty:
-            return {"error": "no_data", "message": f"品牌“{source_brand}”在指定期间没有品牌/类目数据。"}
-
-        category_result = _category_result(category_frame)
-        channel_frame = _query_s2_channels(source_brand, period_meta)
-        product_frame = _query_s4_products(source_brand, period_meta)
-        if channel_frame.empty or product_frame.empty:
-            return {"error": "no_data", "message": f"品牌“{source_brand}”在指定期间缺少渠道或商品数据。"}
-        channel_result = _channel_overview(channel_frame)
-        product_result = _product_analysis(
-            product_frame,
-            selected_category=category_result["selected_category"],
-            brand_candidates=[brand, source_brand, *(brand_aliases or [])],
+            log.info(
+                "[douyin_business] retrying missing store coverage brand=%s period=%s missing=%s",
+                source_brand, period, missing,
+            )
+            if any(row["source"] == "monthly" for row in missing):
+                monthly_brand = _resolve_s2_monthly_brand(
+                    brand, source_brand, period_meta, brand_aliases
+                )
+            if any(row["source"] == "daily" for row in missing):
+                daily_brand = _resolve_s2_daily_brand(
+                    brand, source_brand, period_meta, brand_aliases
+                )
+            if monthly_brand != source_brand or daily_brand != source_brand:
+                category_frame, sources, missing = _query_s2_categories(
+                    source_brand,
+                    period_meta,
+                    monthly_brand=monthly_brand,
+                    daily_brand=daily_brand,
+                )
+        store_missing_detail = "、".join(
+            f"{row['period']} {row['month']}({row['source']})" for row in missing
         )
-        if category_result["selected_category"] and not product_result["series"]:
+        category_result = _category_result(category_frame) if not category_frame.empty else {
+            "total": {"gmv_current": 0.0, "gmv_prior": 0.0, "gmv_change": 0.0, "evol": None},
+            "categories": [], "selected_category": "",
+        }
+        limitations: list[str] = []
+        if missing:
+            limitations.append(
+                f"店铺表数据存在缺口（{store_missing_detail}），"
+                "本次不展示店铺表整体GMV及商品覆盖率。"
+            )
+        elif category_frame.empty:
+            limitations.append("店铺表在指定期间无数据，本次不展示店铺表整体GMV。")
+        product_analysis_v2: dict = {}
+        if product_v2_enabled or product_v2_shadow:
+            try:
+                product_frame = _query_s4_products(source_brand, period_meta)
+                product_analysis_v2 = _product_analysis_v2(
+                    product_frame,
+                    brand_candidates=(brand, source_brand, *(brand_aliases or [])),
+                    store_total=category_result["total"] if not missing else {},
+                )
+                log.info(
+                    "[douyin_product_daily_v2] brand=%s period=%s enabled=%s shadow=%s "
+                    "quality=%s product_total=%s categories=%s drivers=%s",
+                    source_brand, period, product_v2_enabled, product_v2_shadow,
+                    product_analysis_v2.get("quality"),
+                    product_analysis_v2.get("product_total"),
+                    len(product_analysis_v2.get("categories") or []),
+                    len(product_analysis_v2.get("key_drivers") or []),
+                )
+            except Exception as exc:
+                log.exception("[douyin_product_daily_v2] query or analysis failed")
+                if product_v2_enabled:
+                    if _llm_pipeline_enabled():
+                        limitations.append(
+                            "商品明细源暂时不可用，已跳过品类、系列和Key Driver模块。"
+                        )
+                        product_v2_enabled = False
+                    else:
+                        failure = infrastructure_failure(exc, requested_period=period)
+                        return failure_result(failure, error="product_daily_not_ready")
+
+        if product_v2_enabled:
+            quality = product_analysis_v2.get("quality") or {}
+            if quality.get("reason") == "no_data":
+                if _llm_pipeline_enabled():
+                    limitations.append(
+                        "商品明细源在实际覆盖期内无数据，已跳过品类、系列和Key Driver模块。"
+                    )
+                    product_v2_enabled = False
+                else:
+                    latest = _latest_required_date(source_brand, include_product=True)
+                    return failure_result(data_coverage_failure(
+                        brand=brand, platform_label="抖音", requested_period=period,
+                        latest_available_date=latest,
+                        after_latest=bool(latest and period_meta["current_end"] > latest),
+                    ), error="product_daily_no_data")
+            if product_v2_enabled and _enabled("DOUYIN_PRODUCT_DAILY_QUALITY_GATE", "1") and not quality.get("passed"):
+                if _llm_pipeline_enabled():
+                    limitations.append(
+                        "商品明细源质量校验未通过，已跳过品类、系列和Key Driver模块。"
+                    )
+                    product_v2_enabled = False
+                else:
+                    return {
+                        "error": "product_daily_quality_blocked",
+                        "message": (
+                            "抖音商品日表质量检查未通过，已阻断品类和Key Driver分析。"
+                            f"空标签={quality.get('null_driver_rows', 0)}，"
+                            f"无法转数值={quality.get('invalid_numeric_rows', 0)}。"
+                        ),
+                        "quality": quality,
+                    }
+        if product_v2_enabled:
             return {
-                "error": "category_mapping_mismatch",
-                "message": (
-                    f"S2中GMV第一的四级类目为“{category_result['selected_category']}”，"
-                    "但S4的商品四级分类没有匹配记录，请核对两个类目字段的取值口径。"
-                ),
+                "brand": brand,
+                "source_brand": source_brand,
+                "monthly_source_brand": monthly_brand,
+                "daily_source_brand": daily_brand,
+                "period": period,
+                "period_meta": period_meta,
+                "brand_result": category_result["total"] if not missing else {},
+                "categories": product_analysis_v2.get("categories") or [],
+                "selected_category": product_analysis_v2.get("selected_category") or "",
+                "product_analysis": product_analysis_v2,
+                "channel_result": {},
+                "reconciliation": product_analysis_v2.get("reconciliation") or {},
+                "limitations": limitations,
+                "sources": [
+                    *sources,
+                    {
+                        "period": "current+prior", "source": "daily",
+                        "table": S4_PRODUCT_TABLE,
+                        "purpose": "品类、系列、Key Driver与商品链接",
+                        "product_scope": "level4_nonempty_v1",
+                    },
+                ],
             }
-        if channel_result["negative_remainder"] or product_result["negative_short_other"]:
-            return {
-                "error": "negative_channel_remainder",
-                "message": "短视频及其他GMV倒减后出现负数，请先核对渠道字段口径。",
-            }
+
+        # V1 keeps strict store-table coverage. Shadow has already executed,
+        # so a V1 gap no longer prevents collecting V2 rollout evidence.
+        if missing:
+            latest = _latest_required_date(source_brand, include_product=False)
+            return failure_result(data_coverage_failure(
+                brand=brand, platform_label="抖音", requested_period=period,
+                latest_available_date=latest,
+                after_latest=bool(latest and period_meta["current_end"] > latest),
+            ), error="incomplete_coverage")
+        if category_frame.empty:
+            latest = _latest_required_date(source_brand, include_product=False)
+            return failure_result(data_coverage_failure(
+                brand=brand, platform_label="抖音", requested_period=period,
+                latest_available_date=latest,
+                after_latest=bool(latest and period_meta["current_end"] > latest),
+            ), error="no_data")
+
+        # Brand-level channel metrics use the same S2 monthly/daily source
+        # selection as the core report. Douyin product-detail tables are
+        # intentionally outside this report's scope.
+        channel_result: dict = {}
+        try:
+            channel_frame = _query_s2_channels(
+                source_brand, period_meta, monthly_brand=monthly_brand
+            )
+            if channel_frame.empty:
+                limitations.append("渠道日表在指定期间无数据，未展示渠道拆分。")
+            else:
+                channel_result = _channel_overview(channel_frame)
+                if channel_result["negative_remainder"]:
+                    limitations.append("渠道倒减结果出现负数，未展示渠道拆分。")
+                    channel_result = {}
+        except Exception:
+            log.exception("[douyin_business] channel enrichment failed")
+            limitations.append("渠道日表查询超时或连接中断，未展示渠道拆分。")
+
+        reconciliation: dict = {}
+        if channel_result:
+            reconciliation.update({
+                "s2_channel_brand_current": channel_result["denominator"],
+                "s2_channel_brand_prior": channel_result["denominator_prior"],
+            })
+        report_sources = list(sources)
+        report_sources.append({
+            "period": "current+prior",
+            "source": "monthly/daily by natural-month completeness",
+            "table": S2_MONTHLY_TABLE,
+            "purpose": "品牌级渠道占比",
+        })
         return {
             "brand": brand,
             "source_brand": source_brand,
+            "monthly_source_brand": monthly_brand,
             "period": period,
-            "period_meta": {**period_meta, "source_max_date": source_max_date},
+            "period_meta": period_meta,
             "brand_result": category_result["total"],
             "categories": category_result["categories"],
             "selected_category": category_result["selected_category"],
-            "product_series": product_result["series"],
             "channel_result": channel_result,
-            "channel_products": product_result["channels"],
-            "series_mapping": product_result["series_mapping"],
-            "reconciliation": {
-                "s2_channel_brand_current": channel_result["denominator"],
-                "s2_channel_brand_prior": channel_result["denominator_prior"],
-                **product_result["reconciliation"],
-            },
-            "sources": sources + [{
-                "period": "current+prior",
-                "source": "daily",
-                "table": S2_DAILY_TABLE,
-                "purpose": "品牌级渠道占比",
-            }, {
-                "period": "current+prior",
-                "source": "daily",
-                "table": S4_PRODUCT_TABLE,
-                "purpose": "商品、系列、渠道内系列与Top 5链接",
-            }],
+            "reconciliation": reconciliation,
+            "limitations": limitations,
+            "sources": report_sources,
         }
     except Exception as exc:
-        return {"error": "execution_error", "message": str(exc)}
+        log.exception("[douyin_business] query failed brand=%s period=%s", brand, period)
+        return failure_result(
+            infrastructure_failure(exc, requested_period=period),
+            error="execution_error",
+        )

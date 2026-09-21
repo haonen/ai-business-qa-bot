@@ -1,0 +1,109 @@
+{
+  "backup": "/root/ai-business-qa-bot/backups/brand-lookup-ks0ze7jc",
+  "files": {
+    "bot/brand_lookup.py": {
+      "existed": false,
+      "installed_sha256": "fb97938e70fa04cc15f08b74e69379a784837e5b71ee5363a6773dff317983ab"
+    },
+    "bot/session.py": {
+      "existed": true,
+      "installed_sha256": "fbfd94e7fff6632c81f6d95c0aacd2037b6569b13f148d81c2850b8a74e1bb5d"
+    },
+    "bot/brand_lookup_runtime.py": {
+      "existed": false,
+      "installed_sha256": "37915b810f84c4c5049a993b296f9f186f754981d72cddc2575c199fa326b22b"
+    },
+    "bot/brand_source_binding.py": {
+      "existed": false,
+      "installed_sha256": "335f2b7118cc5ada7577574da3487336ed8af0523668865aef17ac3dfb298713"
+    },
+    "bot/app.py": {
+      "existed": true,
+      "installed_sha256": "b430cf0276286054d7281660ee449a0b89799614620c3e6d4d9c19d6f9d7412e"
+    },
+    "bot/brand_lookup_preview.py": {
+      "existed": false,
+      "installed_sha256": "e7900b34c38f72f350e496745cc9933986a9988ecd3fed182f34112df2f3f3bc"
+    },
+    "bot/brand_mapping.py": {
+      "existed": false,
+      "installed_sha256": "b41dd562fe4762d889bdf9d3c176b0012ee165bcf353134ea260214132cb3c48"
+    },
+    "bot/newsletter/qr_footer.py": {
+      "existed": false,
+      "installed_sha256": "325bc0521a39ef50df29fb41764f6ab1cf12d5b17edbeb11e925220fd173aee1"
+    },
+    "bot/newsletter/bot_qr.json": {
+      "existed": false,
+      "installed_sha256": "6c490b2f2d64bdce5e19b90aacdf41c42d277cc112e0dfde43b14d27e776871f"
+    },
+    "bot/newsletter/trial.py": {
+      "existed": false,
+      "installed_sha256": "3be52598b44e5438fbf711dae0e1638dd4fdbbb844698a7ff47b2e595fbad592"
+    },
+    "bot/newsletter/mapping_coverage.py": {
+      "existed": false,
+      "installed_sha256": "720c34d5ef2c269a0351039c951e96bac36ff8b1e526cda98802cf1153c1bcd1"
+    },
+    "bot/newsletter/render.py": {
+      "existed": false,
+      "installed_sha256": "2f2fcbca04aa183a8a479ed8ad8d7d672e2c62a0215b1b4eb0770dbda7861f6b"
+    },
+    "bot/newsletter/email_html.py": {
+      "existed": false,
+      "installed_sha256": "0cb4c9b6fea99027b05b2b2c7a0041f66ace44995a41da639afb0fbf89ec6318"
+    },
+    "bot/newsletter/approved_renderer.py": {
+      "existed": false,
+      "installed_sha256": "49531e33a89d9ed18ed13944b8ec79032407e8db56d30cc077eb4df2e418f412"
+    },
+    "bot/newsletter/scoped_evidence.py": {
+      "existed": false,
+      "installed_sha256": "5e5de01656c3efa12c2c85b3eec5ce98721caf8e0660003502d25e60f3b4afdb"
+    },
+    "bot/newsletter/__init__.py": {
+      "existed": false,
+      "installed_sha256": "7a7f8efacf389680ab8bcd28fcdeffd508e4af20a37dce823d96411fea80e328"
+    },
+    "bot/newsletter/evidence_copy.py": {
+      "existed": false,
+      "installed_sha256": "2f8dc7edf02cf8c48c34a8b4ba6b5013152572617615024fe74c0097e82e6d61"
+    },
+    "bot/newsletter/brand_names.json": {
+      "existed": false,
+      "installed_sha256": "31ed3e43be03768718b1f0f6b481484d3773bf6e93d64eede4fffa9acbcd10c9"
+    },
+    "bot/newsletter/editor.py": {
+      "existed": false,
+      "installed_sha256": "c6923b4be1f4b63e89ce34c826d6aa9be8ed59dfa6033be42e69d834cae443e8"
+    },
+    "bot/newsletter/replay_editor.py": {
+      "existed": false,
+      "installed_sha256": "3c5a9363ba3be465d757f85123b588ce6f8e3a27b8d27cb0a9ce745514a744e7"
+    },
+    "bot/newsletter/approved-template.html": {
+      "existed": false,
+      "installed_sha256": "17bd01758b899e32e30befd25163d2a84bf6bcac6fe9e37e44ecca97d7f26131"
+    },
+    "bot/newsletter/__main__.py": {
+      "existed": false,
+      "installed_sha256": "f85abf20ade6185270688e9877ed62593c64e0668af823983e44fb5c54a70130"
+    },
+    "bot/newsletter/data.py": {
+      "existed": false,
+      "installed_sha256": "5c8a5feda7abfc1631eb4db7f9a18a45a01fb86421f9cd02f6ca8e1aaeefd1c6"
+    },
+    "bot/newsletter/summary_facts.py": {
+      "existed": false,
+      "installed_sha256": "434fdd88a986e2145893d122851921687b1a885a8ace0d9c00cc22f3c2812943"
+    },
+    "scripts/brand_lookup_deploy/control.py": {
+      "existed": false,
+      "installed_sha256": "b8c33ab7a32bb245b707d6cdf8987e3fc0e3e307a43730e3431f3757284fcd36"
+    },
+    "scripts/brand_lookup_deploy/preflight.py": {
+      "existed": false,
+      "installed_sha256": "02160ad71ca7ad93005cdf452846d0987dc22b3ebefdc16d8f163580b076b056"
+    }
+  }
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bot.tools.common import combine_periods, filter_sku, split_periods, tool
+from bot.failures import StructuredAnalysisError, failure_result, infrastructure_failure
 
 
 @tool
@@ -41,5 +42,7 @@ def query_category(
             "total": total,
             "categories": rows,
         }
+    except StructuredAnalysisError as exc:
+        return failure_result(exc.failure)
     except Exception as exc:
-        return {"error": "execution_error", "message": str(exc)}
+        return failure_result(infrastructure_failure(exc, requested_period=str(period)))

@@ -26,6 +26,7 @@ def query_douyin_gmv(
                 MAX(CAST(`业务日期` AS DATE)) AS max_date
             FROM ai_bot_dy_product_link
             WHERE `商品品牌` = :brand
+          AND NULLIF(TRIM(`商品四级分类`), '') IS NOT NULL
               AND (
                 CAST(`业务日期` AS DATE) BETWEEN :focus_start AND :focus_end
                 OR CAST(`业务日期` AS DATE) BETWEEN :prior_start AND :prior_end

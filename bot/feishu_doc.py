@@ -1,3 +1,4 @@
+from bot.timing import timed, job_timed, sql_timed, span, event
 """
 feishu_doc.py — 生成飞书云文档，写入分析报告
 
@@ -47,6 +48,7 @@ def _retryable_doc_response(resp) -> bool:
     )
 
 
+@timed('document.api_with_retries')
 def _doc_call_with_retry(call, label: str, attempts: int = _DOC_RETRY_ATTEMPTS):
     """Retry transient Feishu Docx failures, including empty 429 responses."""
     last_error = None
@@ -239,6 +241,7 @@ def _compact_wide_table(headers: list, rows: list, max_cols: int = 9) -> tuple[l
     return headers, rows
 
 
+@timed('document.write_sheet_table')
 def _write_sheet_table(client: lark.Client, doc_id: str, headers: list, rows: list):
     """
     Create an embedded spreadsheet block in the doc and write table values into it.
@@ -344,6 +347,7 @@ def _table_text_fallback(headers: list, rows: list) -> list:
     return result
 
 
+@timed('document.write_table')
 def _write_table(client: lark.Client, doc_id: str, headers: list, rows: list):
     """
     Create a native Feishu table block and populate each cell.
@@ -496,6 +500,7 @@ def _parse_table_lines(table_lines: list[str]) -> _TableSpec | None:
     return None
 
 
+@timed('document.parse_markdown')
 def markdown_to_items(content: str) -> list:
     """
     Parse markdown into a list of Block objects and _TableSpec placeholders.
@@ -583,6 +588,7 @@ def markdown_to_items(content: str) -> list:
 
 # ── Block batch writer ────────────────────────────────────────────────────────
 
+@timed('document.write_blocks')
 def _flush_blocks(client: lark.Client, doc_id: str, blocks: list):
     """Write a batch of simple Block objects to the document root."""
     if not blocks:
@@ -608,6 +614,7 @@ def _flush_blocks(client: lark.Client, doc_id: str, blocks: list):
 
 # ── Document creation ─────────────────────────────────────────────────────────
 
+@timed('document.create')
 def create_feishu_doc(client: lark.Client, title: str, markdown_content: str) -> str:
     """
     Create a Feishu cloud document and write markdown content into it.

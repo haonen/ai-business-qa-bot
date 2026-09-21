@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
 import pandas as pd
 
 from bot.market_formatter import format_market_result
-from bot.market_plan import build_market_plan
+from bot.market_plan import MarketPlan, build_market_plan
+from bot.chains.market_chain import run_market_chain
 from bot.router import route
 from bot.session import SessionState
 from bot.tools.query_market_top_brands import query_market_top_brands
@@ -14,11 +16,68 @@ from bot.tools.query_market_brand_deep_dive import (
     _platform_and_month_analysis,
     _select_representative_brands,
 )
+from bot.chains.market_chain import _select_growth_platform
 from bot.tools.query_market_trend import query_market_trend
+from bot.tools.market_common import store_rank_business_category_sql
 from bot.utils import parse_ec_period
 
 
 class MarketPlanTest(unittest.TestCase):
+    def test_growth_platform_selector_uses_absolute_gmv_change(self):
+        selected = _select_growth_platform({"platforms": [
+            {"platform": "TM", "gmv_actual": 110, "gmv_prior": 100, "gmv_growth": 10},
+            {"platform": "DY", "gmv_actual": 80, "gmv_prior": 50, "gmv_growth": 30},
+            {"platform": "JD", "gmv_actual": 200, "gmv_prior": 190, "gmv_growth": 10},
+        ]})
+        self.assertEqual(selected["platform"], "DY")
+
+    @patch("bot.chains.market_chain.run_jd_business_chain")
+    @patch("bot.chains.market_chain.run_douyin_business_chain")
+    @patch("bot.chains.market_chain.run_default_chain")
+    @patch("bot.chains.market_chain.format_market_result")
+    @patch("bot.chains.market_chain.query_market_brand_deep_dive")
+    def test_deep_dive_selects_platform_per_brand_and_runs_existing_templates(
+        self, query_deep_dive, format_result, run_tmall, run_douyin, run_jd,
+    ):
+        query_deep_dive.return_value = {
+            "query_meta": {"tool": "query_market_brand_deep_dive"},
+            "brands": [
+                {"brand": "A", "platforms": [
+                    {"platform": "TM", "gmv_actual": 120, "gmv_prior": 100, "gmv_growth": 20},
+                    {"platform": "DY", "gmv_actual": 90, "gmv_prior": 50, "gmv_growth": 40},
+                ]},
+                {"brand": "B", "platforms": [
+                    {"platform": "TM", "gmv_actual": 80, "gmv_prior": 70, "gmv_growth": 10},
+                    {"platform": "JD", "gmv_actual": 100, "gmv_prior": 60, "gmv_growth": 40},
+                ]},
+                {"brand": "C", "platforms": [
+                    {"platform": "TM", "gmv_actual": 100, "gmv_prior": 60, "gmv_growth": 40},
+                    {"platform": "DY", "gmv_actual": 70, "gmv_prior": 60, "gmv_growth": 10},
+                ]},
+            ],
+        }
+        format_result.return_value = {
+            "ok": True, "markdown": "matrix",
+            "meta": {"top_brands": ["A", "B", "C"], "document_ready": True},
+        }
+        run_tmall.return_value = {"ok": True, "markdown": "C tmall", "meta": {}}
+        run_douyin.return_value = {"ok": True, "markdown": "A douyin", "meta": {}}
+        run_jd.return_value = {"ok": True, "markdown": "B jd", "meta": {}}
+        with patch.dict(os.environ, {"AGENT_PLAN_MARKET_PLATFORM_FANOUT_ENABLED": "1"}):
+            result = run_market_chain(MarketPlan(
+                intent="market_brand_deep_dive", period="2026年6月", ranking_limit=3,
+            ))
+        run_douyin.assert_called_once_with("A", "2026年6月", brand_aliases=["A"])
+        run_jd.assert_called_once_with("B", "2026年6月", brand_aliases=["B"])
+        run_tmall.assert_called_once_with("C", "2026年6月", brand_aliases=["C"])
+        self.assertEqual(
+            [row["platform"] for row in result["meta"]["selected_platform_by_brand"]],
+            ["DY", "JD", "TM"],
+        )
+        self.assertIn("A douyin", result["markdown"])
+        self.assertIn("B jd", result["markdown"])
+        self.assertIn("C tmall", result["markdown"])
+
     def test_q2_mass_top3_means_scale_top3_and_deep_dive(self):
         plan = build_market_plan("分析2026年q2 mass beauty的top3品牌是哪些，是如何成为top3的")
         self.assertEqual(plan.intent, "market_brand_deep_dive")
@@ -36,6 +95,53 @@ class MarketPlanTest(unittest.TestCase):
         self.assertEqual(plan.intent, "market_brand_deep_dive")
         self.assertEqual(plan.platform, "TTL")
         self.assertEqual(plan.period, "2026年1-6月")
+
+    @patch("bot.chains.market_chain.run_media_chain")
+    @patch("bot.chains.market_chain.format_market_result")
+    @patch("bot.chains.market_chain.query_market_brand_deep_dive")
+    def test_composite_market_plan_queries_bet_for_each_selected_brand(
+        self, query_deep_dive, format_result, run_media,
+    ):
+        query_deep_dive.return_value = {"query_meta": {"tool": "query_market_brand_deep_dive"}}
+        format_result.return_value = {
+            "ok": True, "markdown": "market report",
+            "meta": {"top_brands": ["A", "B", "C"], "document_ready": True},
+        }
+        run_media.side_effect = [
+            {"ok": True, "markdown": f"{brand} bet", "meta": {"period": "2026年1-5月"}}
+            for brand in ("A", "B", "C")
+        ]
+        progress = []
+        result = run_market_chain(MarketPlan(
+            intent="market_brand_deep_dive", period="2026年6月",
+            ranking_limit=3, include_bet=True, bet_latest_ytd=True,
+        ), on_progress=progress.append)
+        self.assertEqual(run_media.call_count, 3)
+        self.assertIn("A bet", result["markdown"])
+        self.assertIn("C bet", result["markdown"])
+        self.assertTrue(result["meta"]["include_bet"])
+        self.assertTrue(any("第3/3个品牌" in message for message in progress))
+
+
+class MarketCategoryContractTest(unittest.TestCase):
+    def test_total_beauty_is_skincare_makeup_and_hair_without_fragrance(self):
+        sql = store_rank_business_category_sql("TOTAL BEAUTY")
+        self.assertIn("= 'skincare'", sql)
+        self.assertIn("= 'hair'", sql)
+        self.assertIn("'makeup (exclude fragrance)'", sql)
+        self.assertIn("'makeup + fragrance'", sql)
+        self.assertNotIn("= 'fragrance'", sql)
+
+    def test_female_skincare_subtracts_male_skincare_at_level_two(self):
+        sql = store_rank_business_category_sql("FEMALE SKINCARE")
+        self.assertIn("category_EN_level_1", sql)
+        self.assertIn("category_EN_level_2", sql)
+        self.assertIn("<> 'male skincare'", sql)
+
+    def test_male_skincare_requires_skin_level_one_and_male_level_two(self):
+        sql = store_rank_business_category_sql("MALE SKINCARE")
+        self.assertIn("= 'skincare'", sql)
+        self.assertIn("= 'male skincare'", sql)
 
     @patch("bot.router.classify_user_intent", return_value=None)
     def test_exact_multidimensional_request_routes_end_to_end(self, _mock):
@@ -178,7 +284,7 @@ class MarketRouterTest(unittest.TestCase):
         state.market_context.period = "2026年6月"
         state.market_context.top_brands = ["KANS", "PROYA"]
         result = route("第2名的生意怎么样", state)
-        self.assertEqual((result.type, result.brand, result.period), ("default_chain", "PROYA", "2026年6月"))
+        self.assertEqual((result.type, result.brand, result.period), ("clarify_ec_platform", "PROYA", "2026年6月"))
 
     @patch("bot.router.classify_user_intent", return_value=None)
     def test_ordinal_jumps_to_bet(self, _mock):
@@ -230,7 +336,40 @@ class MarketTrendToolTest(unittest.TestCase):
         ttl = result["rows"][0]
         self.assertEqual(ttl["gmv_actual"], 350)
         self.assertTrue(all(row["source"] == "monthly" for row in result["coverage"]))
-        self.assertIn("LPAD(DAY(bus_date)", mock_fetch.call_args_list[0].args[0])
+        monthly_sql = mock_fetch.call_args_list[0].args[0]
+        self.assertIn("CAST(bus_date AS DATE)", monthly_sql)
+        self.assertNotIn("DAY(bus_date)", monthly_sql)
+
+    @patch("bot.tools.query_market_trend.fetch_df")
+    def test_full_january_to_june_uses_natural_monthly_dates(self, mock_fetch):
+        monthly = pd.DataFrame([
+            {
+                "period_key": period,
+                "source_month": f"{year}-{month:02d}",
+                "platform": platform,
+                "row_count": 1,
+                "gmv": 100,
+            }
+            for period, year in (("current", 2026), ("prior", 2025))
+            for month in range(1, 7)
+            for platform in ("TM", "DY", "JD")
+        ])
+        mock_fetch.side_effect = [monthly, pd.DataFrame()]
+        result = query_market_trend("2026年1-6月")
+        self.assertFalse(result.get("error"))
+        self.assertEqual(len(result["coverage"]), 36)
+        self.assertTrue(all(row["source"] == "monthly" for row in result["coverage"]))
+        current_months = {
+            row["month"] for row in result["coverage"]
+            if row["period_key"] == "current"
+        }
+        self.assertEqual(
+            current_months,
+            {f"2026-{month:02d}" for month in range(1, 7)},
+        )
+        monthly_sql = mock_fetch.call_args_list[0].args[0]
+        self.assertIn("DATE_FORMAT(CAST(bus_date AS DATE), '%Y-%m')", monthly_sql)
+        self.assertNotIn("LPAD(DAY(bus_date)", monthly_sql)
 
     @patch("bot.tools.query_market_trend.fetch_df")
     def test_partial_month_uses_daily(self, mock_fetch):
@@ -335,9 +474,10 @@ class MarketRankingToolTest(unittest.TestCase):
         self.assertEqual(mock_fetch.call_count, 1)
         sql, params = mock_fetch.call_args.args
         self.assertNotIn("tmall_store_ranking_day_jiashicang", sql)
-        self.assertIn("bus_date BETWEEN :current_month_start", sql)
-        self.assertEqual(params["current_month_start"], "2026-01-01")
-        self.assertEqual(params["current_month_end"], "2026-01-06")
+        self.assertIn("CAST(bus_date AS DATE) BETWEEN :current_start", sql)
+        self.assertNotIn("current_month_start", params)
+        self.assertEqual(params["current_start"], "2026-01-01")
+        self.assertEqual(params["current_end"], "2026-06-30")
 
     @patch("bot.tools.query_market_top_brands.fetch_df")
     def test_scale_ranking_deduplicates_monthly_business_rows(self, mock_fetch):
@@ -356,7 +496,57 @@ class MarketRankingToolTest(unittest.TestCase):
         self.assertEqual([row["brand"] for row in result["rows"]], ["GUYU", "FAN BEAUTY", "PECHOIN"])
         sql = mock_fetch.call_args.args[0]
         self.assertIn("MAX(CAST(REPLACE(NULLIF(TRIM(gmv)", sql)
-        self.assertIn("GROUP BY bus_date, category_CN", sql)
+        self.assertIn("GROUP BY bus_date, clear_category_status, category_CN", sql)
+        self.assertIn("category_EN_level_1", sql)
+        self.assertIn("'makeup (exclude fragrance)'", sql)
+
+    @patch("bot.tools.query_market_top_brands.fetch_df")
+    def test_female_skincare_ranking_uses_shared_level_one_and_two_scope(self, mock_fetch):
+        mock_fetch.return_value = pd.DataFrame([
+            {"period_key": period, "source_month": month, "platform": "TM",
+             "brand_name": "A", "row_count": 1, "gmv": value}
+            for period, month, value in (
+                ("current", "2026-07", 100), ("prior", "2025-07", 80),
+            )
+        ])
+        result = query_market_top_brands(
+            "2026年7月", segment="PURE MASS", platform="TM",
+            ranking_metric="gmv_actual", limit=5, category="FEMALE SKINCARE",
+        )
+        self.assertFalse(result.get("error"))
+        sql = mock_fetch.call_args.args[0]
+        self.assertIn("= 'skincare'", sql)
+        self.assertIn("<> 'male skincare'", sql)
+        self.assertEqual(result["query_meta"]["category"], "FEMALE SKINCARE")
+
+    @patch("bot.tools.query_market_top_brands.fetch_df")
+    def test_ttl_accepts_tmall_platform_alias_and_preserves_requested_top_n(self, mock_fetch):
+        rows = []
+        for period, year, multiplier in (("current", 2026, 1.0), ("prior", 2025, 0.8)):
+            for month in (2, 3, 4):
+                for source_platform in ("TMALL", "DY", "JD"):
+                    rows.append({
+                        "period_key": period,
+                        "source_month": f"{year}-{month:02d}",
+                        "platform": "TM" if source_platform == "TMALL" else source_platform,
+                        "brand_name": "A",
+                        "row_count": 1,
+                        "gmv": 100 * multiplier,
+                    })
+        mock_fetch.return_value = pd.DataFrame(rows)
+        result = query_market_top_brands("2026年2-4月", platform="TTL", limit=3)
+        self.assertFalse(result.get("error"))
+        sql = mock_fetch.call_args.args[0]
+        self.assertIn("'TMALL'", sql)
+        self.assertIn("THEN 'TM'", sql)
+
+    @patch("bot.tools.query_market_top_brands.fetch_df", return_value=pd.DataFrame())
+    def test_ttl_missing_coverage_reports_monthly_and_requested_top_n(self, _mock_fetch):
+        result = query_market_top_brands("2026年2-4月", platform="TTL", limit=3)
+        self.assertEqual(result["error"], "incomplete_coverage")
+        self.assertIn("2026-02(monthly)", result["message"])
+        self.assertIn("Top 3", result["message"])
+        self.assertNotIn("Top 5", result["message"])
 
     @patch("bot.tools.query_market_top_brands.fetch_df")
     def test_pure_mass_brand_ranking_filters_null_selectivity(self, mock_fetch):
@@ -365,7 +555,8 @@ class MarketRankingToolTest(unittest.TestCase):
         monthly_sql = mock_fetch.call_args_list[0].args[0]
         daily_sql = mock_fetch.call_args_list[1].args[0]
         self.assertIn("SELECTIVITY IS NULL", monthly_sql)
-        self.assertIn("LPAD(DAY(bus_date)", monthly_sql)
+        self.assertIn("CAST(bus_date AS DATE)", monthly_sql)
+        self.assertNotIn("LPAD(DAY(bus_date)", monthly_sql)
         self.assertIn("d.bus_date BETWEEN :daily_0_start", daily_sql)
         self.assertNotIn("CAST(d.bus_date AS DATE)", daily_sql)
         self.assertIn("d.SELECTIVITY IS NULL", daily_sql)

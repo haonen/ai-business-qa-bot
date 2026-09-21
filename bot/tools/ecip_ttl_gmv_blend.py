@@ -6,10 +6,14 @@ from typing import Callable
 
 import pandas as pd
 
-from bot.tools.market_common import date_cast_sql, monthly_business_date_sql
-
-
-_TTL_CATEGORY_SQL = "'Skincare', 'Hair', 'Makeup + Fragrance', 'Makeup+Fragrance'"
+from bot.tools.market_common import (
+    date_cast_sql,
+    store_rank_business_category_sql,
+    store_rank_core_category_sql,
+    store_rank_monthly_date_sql,
+)
+from bot.platforms import platform_filter_sql
+from bot.store_report_scope import amount_sql
 
 
 def _month_slices(start: str, end: str) -> list[dict]:
@@ -56,7 +60,7 @@ def query_blended_tmall_ttl_gmv(
     prior_end: str,
 ) -> dict:
     """Use monthly data for complete available months and daily data elsewhere."""
-    monthly_date = monthly_business_date_sql("bus_date")
+    monthly_date = store_rank_monthly_date_sql("bus_date")
     daily_date = date_cast_sql("bus_date")
     monthly_sql = f"""
         SELECT
@@ -64,15 +68,15 @@ def query_blended_tmall_ttl_gmv(
                THEN 'current' ELSE 'prior' END AS period_key,
           DATE_FORMAT({monthly_date}, '%Y-%m') AS source_month,
           COUNT(*) AS row_count,
-          COALESCE(SUM(gmv), 0) AS gmv
+          COALESCE(SUM({amount_sql('gmv','TM')}), 0) AS gmv
         FROM three_platform_store_rank_monthly
         WHERE brand_name = :brand
-          AND UPPER(TRIM(platform)) IN ('TM', 'TMALL')
+          AND {platform_filter_sql('three_platform_store_rank_monthly', 'TM')}
           AND (
             {monthly_date} BETWEEN :current_start_iso AND :current_end_iso
             OR {monthly_date} BETWEEN :prior_start_iso AND :prior_end_iso
           )
-          AND category_EN_level_1 IN ({_TTL_CATEGORY_SQL})
+          AND {store_rank_core_category_sql()}
         GROUP BY period_key, DATE_FORMAT({monthly_date}, '%Y-%m')
     """
     daily_sql = f"""
@@ -81,15 +85,14 @@ def query_blended_tmall_ttl_gmv(
                THEN 'current' ELSE 'prior' END AS period_key,
           DATE_FORMAT({daily_date}, '%Y-%m') AS source_month,
           COUNT(*) AS row_count,
-          COALESCE(SUM(CAST(REPLACE(NULLIF(TRIM(gmv), ''), ',', '')
-            AS DECIMAL(24, 4))), 0) AS gmv
+          COALESCE(SUM({amount_sql("CAST(REPLACE(NULLIF(TRIM(gmv), ''), ',', '') AS DECIMAL(24,4))",'TM')}), 0) AS gmv
         FROM tmall_store_ranking_day_jiashicang
         WHERE brand_name = :brand
           AND (
             {daily_date} BETWEEN :current_start_iso AND :current_end_iso
             OR {daily_date} BETWEEN :prior_start_iso AND :prior_end_iso
           )
-          AND category_EN_level_1 IN ({_TTL_CATEGORY_SQL})
+          AND {store_rank_business_category_sql('TOTAL BEAUTY')}
         GROUP BY period_key,
           DATE_FORMAT({daily_date}, '%Y-%m')
     """
@@ -100,8 +103,31 @@ def query_blended_tmall_ttl_gmv(
         "prior_start_iso": prior_start,
         "prior_end_iso": prior_end,
     }
-    monthly_lookup = _to_lookup(fetcher(monthly_sql, params))
-    daily_lookup = _to_lookup(fetcher(daily_sql, params))
+    from bot.brand_query import enabled, apply_brand_predicate, validate_query_dates, require_platform
+    monthly_params, daily_params = dict(params), dict(params)
+    mapping_audit = {}
+    monthly_unavailable_reason = None
+    needs_monthly = any(item["full_month"] for start,end in ((current_start,current_end),(prior_start,prior_end)) for item in _month_slices(start,end))
+    if enabled():
+        require_platform("TM")
+        validate_query_dates({key.removesuffix('_iso'):value for key,value in params.items() if key!='brand'})
+        if needs_monthly:
+            from bot.brand_query import BrandQueryError
+            try:
+                monthly_sql,monthly_params,mapping_audit['monthly']=apply_brand_predicate(
+                    monthly_sql,monthly_params,brand=brand,table='three_platform_store_rank_monthly',field='brand_name')
+            except BrandQueryError as exc:
+                # Monthly is preferred, not mandatory. Never bypass its mapping;
+                # let the independently verified daily source cover the period.
+                if exc.status != 'unverified_source':
+                    raise
+                needs_monthly = False
+                monthly_unavailable_reason = exc.status
+                mapping_audit['monthly'] = {'status': exc.status, 'queried': False}
+        daily_sql,daily_params,mapping_audit['daily']=apply_brand_predicate(
+            daily_sql,daily_params,brand=brand,table='tmall_store_ranking_day_jiashicang',field='brand_name')
+    monthly_lookup = _to_lookup(fetcher(monthly_sql, monthly_params)) if needs_monthly else {}
+    daily_lookup = _to_lookup(fetcher(daily_sql, daily_params))
     period_ranges = {
         "current": (current_start, current_end),
         "prior": (prior_start, prior_end),
@@ -142,10 +168,12 @@ def query_blended_tmall_ttl_gmv(
             "row_count": sum(row["row_count"] for row in period_rows),
         }
     return {
+        "brand_mapping_audit": mapping_audit,
         "rows": rows,
         "totals": totals,
         "coverage": {
             "monthly_used": sorted(set(monthly_used)),
+            "monthly_unavailable_reason": monthly_unavailable_reason,
             "daily_used": sorted(set(daily_used)),
             "missing": sorted(set(missing)),
         },

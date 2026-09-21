@@ -282,7 +282,7 @@ def _ratio_metrics(spend: dict, nso: dict) -> dict:
     if not spend or spend.get("actual_yuan") is None or nso.get("error"):
         return {"actual": None, "prior": None, "change": None, "status": "missing_current"}
     actual = safe_div(spend.get("actual_yuan"), nso.get("nso_actual"))
-    prior = safe_div(spend.get("prior_yuan"), nso.get("nso_prior"))
+    prior = safe_div(spend.get("prior_yuan"), nso.get("nso_prior")) if spend.get("prior_yuan") is not None else None
     statuses = (spend.get("comparison_status"), nso.get("comparison_status"))
     status = next((value for value in statuses if value and value != "ok"), "ok")
     if prior == 0 and status == "ok":
@@ -333,17 +333,12 @@ def _investment_row(
             if show_nso and not nso.get("error") else "—"
         ),
         "NSO Evol%": (
-            _fmt_comparison(
-                nso.get("evol"),
-                nso.get("comparison_status"),
-                nso.get("nso_actual"),
-                nso.get("nso_prior"),
-            )
+            _fmt_evol(nso.get("evol"))
             if show_nso and not nso.get("error") else "—"
         ),
         "媒体费比": _fmt_pct(ratio.get("actual")) if show_ratio else "—",
         "费比变化": (
-            _fmt_weight_change(ratio.get("change"), ratio.get("status"))
+            _fmt_pp(ratio.get("change"))
             if show_ratio and not nso.get("error") else "—"
         ),
     }, ratio
@@ -367,9 +362,7 @@ def _media_bullets(
             f"{_fmt_comparison(nso.get('evol'), nso.get('comparison_status'), nso.get('nso_actual'), nso.get('nso_prior'))}"
         )
         if ttl_ratio.get("actual") is not None:
-            fee_change = _fmt_weight_change(
-                ttl_ratio.get("change"), ttl_ratio.get("status")
-            )
+            fee_change = _fmt_pp(ttl_ratio.get("change"))
             ttl_text += f"；媒体费比{_fmt_pct(ttl_ratio.get('actual'))}"
             if fee_change != "—":
                 ttl_text += f"，较同期{fee_change}"
@@ -492,6 +485,7 @@ def _render_media(investment: dict, nso: dict) -> str:
             "未覆盖的其他交易媒体仍保留在Transaction总额中。_"
         ),
     ])
+    parts.extend("\n> _" + remark + "_" for remark in nso.get("remarks", []))
     if nso.get("error"):
         parts.extend([
             "",
@@ -780,8 +774,36 @@ def format_media_report(
     douyin_result: dict,
     resolved_brands: dict,
     brand_match_methods: dict | None = None,
+    media_mode: str | None = None,
+    media_channels: list[str] | None = None,
+    period_adjustment: dict | None = None,
 ) -> str:
-    return "\n".join([
+    from bot.tools.query_ec_nso import BET_SCOPE_NOTE
+    coverage_notice = []
+    if period_adjustment:
+        latest = period_adjustment.get("latest_available_month") or ""
+        latest_month = int(latest[-2:]) if len(latest) >= 7 else latest
+        coverage_notice += [
+            "> **数据覆盖提示**：你请求的是"
+            f"{period_adjustment.get('requested_display')}；Topline BET数据最新到"
+            f"{latest_month}月，本报告已自动按"
+            f"{period_adjustment.get('effective_display')}输出完整可用分析。",
+            "",
+        ]
+    channels = {str(channel).upper() for channel in (media_channels or [])}
+    if media_mode == "CHANNEL_ONLY":
+        sections = [
+            f"# {display_brand} Douyin相关BET分析",
+            "",
+            "> _本报告按用户确认的媒体渠道范围输出，仅呈现对应渠道可观测数据；不推断媒体投放导致电商GMV变化。_",
+        ]
+        if "DOUYIN" in channels:
+            sections.extend(["", _render_kol_platform(douyin_result, "DOUYIN", "1")])
+        if "RED" in channels:
+            sections.extend(["", _render_kol_platform(red_result, "RED", "1")])
+        sections.extend(["", "> **Remark**：" + BET_SCOPE_NOTE])
+        return "\n".join(coverage_notice + sections)
+    return "\n".join(coverage_notice + [
         _render_media(investment_result, nso_result),
         "",
         "# 2. KOL Performance",
@@ -796,4 +818,5 @@ def format_media_report(
         _render_kol_platform(douyin_result, "DOUYIN", "2.2"),
         "",
         _render_search(search_result, "3"),
+        "", "> **Remark**：" + BET_SCOPE_NOTE,
     ])

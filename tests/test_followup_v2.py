@@ -13,8 +13,13 @@ from bot.session import SessionState
 from bot.skills.loader import load_meta_answers
 from bot.tools.query_bet_followup_table import query_bet_followup_table
 from bot.tools.query_change_contribution import query_change_contribution
-from bot.tools.query_ec_followup_table import query_ec_followup_table
-from bot.chains.followup_v2_chain import _ec_bundle_dimensions, _required_sources
+from bot.tools.query_ec_followup_table import _raw_rows, query_ec_followup_table
+from bot.chains.followup_v2_chain import (
+    _ec_bundle_dimensions,
+    _input_metric_mismatch_note,
+    _required_sources,
+    run_followup_v2_chain,
+)
 from bot.app import _run_direct
 
 
@@ -30,21 +35,19 @@ class FollowupRouteV2Test(unittest.TestCase):
 
     def test_capability_answer_covers_four_entry_types(self):
         content = load_meta_answers()
-        for heading in ("EC生意分析", "BET媒体投资分析", "深入分析", "数据整理"):
+        for heading in ("品牌生意分析", "市场与品牌排名", "BET媒体投资", "使用方式"):
             self.assertIn(heading, content)
 
-    def test_capability_answer_has_two_clear_groups(self):
+    def test_capability_answer_is_organized_by_business_capability(self):
         content = load_meta_answers()
-        self.assertLess(content.index("一、完整分析报告"), content.index("1. EC生意分析"))
-        self.assertLess(content.index("1. EC生意分析"), content.index("2. BET媒体投资分析"))
-        self.assertLess(content.index("二、继续追问"), content.index("3. 深入分析"))
-        self.assertLess(content.index("3. 深入分析"), content.index("4. 数据整理"))
+        self.assertLess(content.index("品牌生意分析"), content.index("市场与品牌排名"))
+        self.assertLess(content.index("市场与品牌排名"), content.index("BET媒体投资"))
 
-    def test_capability_answer_requires_clear_followup_prefix(self):
+    def test_capability_answer_does_not_require_followup_prefix(self):
         content = load_meta_answers()
-        self.assertIn("问题前加上“追问：”", content)
-        self.assertNotIn("不需要输入“追问”", content)
-        self.assertIn("- 追问：T2主要靠哪些品类？", content)
+        self.assertIn("不需要", content)
+        self.assertIn("追问：", content)
+        self.assertNotIn("问题前加上“追问：”", content)
 
     @patch("bot.router.classify_user_intent")
     def test_narrow_media_request_uses_followup_skill(self, classify):
@@ -65,7 +68,10 @@ class FollowupRouteV2Test(unittest.TestCase):
         state = SessionState()
         state.bet_context.brand = "珀莱雅"
         state.bet_context.period = "2026年3月"
-        result = route("按月看RED的BKFS花费结构。", state)
+        with patch.dict(os.environ, {
+            "ROUTER_V2_ENABLED": "1", "ENTITY_RESOLVER_V2_ENABLED": "1",
+        }, clear=False):
+            result = route("按月看RED的BKFS花费结构。", state)
         self.assertEqual(result.type, "skill_dispatch")
         self.assertEqual(result.brand, "珀莱雅")
         self.assertEqual(result.period, "2026年3月")
@@ -81,6 +87,32 @@ class FollowupRouteV2Test(unittest.TestCase):
         self.assertEqual(result.brand, "珀莱雅")
         self.assertEqual(result.period, "2026年3月")
         self.assertEqual(result.brand_aliases, ["珀莱雅", "PROYA"])
+
+    def test_explicit_brand_and_cost_growth_override_stale_ec_context(self):
+        state = SessionState()
+        state.ec_context.brand = "dirovo"
+        state.ec_context.period = "2026年3月"
+        state.bet_context.brand = "旧媒体品牌"
+        state.bet_context.period = "2026年3月"
+
+        result = route(
+            "追问：为什么花西子的费用增长了+708.7%，公司做了什么策略吗？",
+            state,
+        )
+
+        self.assertEqual(result.type, "skill_dispatch")
+        self.assertEqual(result.brand, "花西子")
+        self.assertEqual(result.period, "2026年3月")
+        self.assertEqual(result.brand_aliases, ["花西子"])
+
+    def test_followup_comma_prefix_is_supported(self):
+        state = SessionState()
+        state.bet_context.brand = "花西子"
+        state.bet_context.period = "2026年3月"
+        state.drilldown_ctx.last_analysis_view = "bet_followup"
+        result = route("追问，你去搜索一下期间发生了什么事情", state)
+        self.assertEqual(result.type, "skill_dispatch")
+        self.assertEqual(result.brand, "花西子")
 
     @patch("bot.router.classify_user_intent")
     def test_broad_media_request_stays_full_report(self, classify):
@@ -241,12 +273,63 @@ class FollowupPlannerTest(unittest.TestCase):
         self.assertEqual(plan.filters["key_driver"], "T2")
         self.assertEqual(plan.group_by, ["category"])
 
+    def test_non_kol_performance_never_sources_bet(self):
+        state = SessionState()
+        state.ec_context.brand = "谷雨"
+        state.ec_context.period = "2026年5月"
+        plan = build_followup_plan("Non-KOL的表现", state)
+        self.assertEqual(plan.domain, "ec")
+        self.assertEqual(plan.filters["key_driver"], "Non-KOL")
+        self.assertEqual(plan.metrics, ["gmv_actual", "gmv_evol"])
+
+    def test_multiple_tmall_key_drivers_are_kept_as_one_comparison_plan(self):
+        state = SessionState()
+        state.ec_context.brand = "谷雨"
+        state.ec_context.period = "2026年5月"
+        plan = build_followup_plan("李佳琦、T2和Non-KOL的生意分别有多少", state)
+        self.assertEqual(plan.domain, "ec")
+        self.assertEqual(plan.filters["key_driver"], ["李佳琦", "T2", "Non-KOL"])
+        self.assertEqual(plan.group_by, ["key_driver"])
+
     def test_ec_and_bet_context_are_independent(self):
         state = SessionState()
         state.ec_context.brand, state.ec_context.period = "珀莱雅", "2026年3月"
         state.bet_context.brand, state.bet_context.period = "韩束", "2026年4月"
         plan = build_followup_plan("按月整理媒体费比", state)
         self.assertEqual((plan.brand, plan.period["raw"]), ("韩束", "2026年4月"))
+
+    def test_strategy_question_uses_explicit_brand_and_bet_spend(self):
+        state = SessionState()
+        state.ec_context.brand, state.ec_context.period = "dirovo", "2026年3月"
+        state.bet_context.brand, state.bet_context.period = "旧媒体品牌", "2026年3月"
+        plan = build_followup_plan(
+            "为什么花西子的费用增长了，公司做了什么策略吗",
+            state,
+            brand="花西子",
+            period="2026年3月",
+        )
+        self.assertEqual(plan.brand, "花西子")
+        self.assertEqual(plan.domain, "bet")
+        self.assertEqual(plan.metrics, ["spend_actual", "spend_evol"])
+
+    def test_vague_correction_keeps_last_bet_followup_context(self):
+        state = SessionState()
+        state.ec_context.brand, state.ec_context.period = "dirovo", "2026年3月"
+        state.bet_context.brand, state.bet_context.period = "花西子", "2026年3月"
+        state.drilldown_ctx.last_analysis_view = "bet_followup"
+        plan = build_followup_plan("你没回答对，为什么会这样呢", state)
+        self.assertEqual((plan.domain, plan.brand), ("bet", "花西子"))
+
+    def test_web_search_request_is_not_misrepresented_as_internal_search_kpi(self):
+        state = SessionState()
+        result = run_followup_v2_chain(
+            "你去搜索一下期间发生了什么事情",
+            state,
+            brand="花西子",
+            period="2026年3月",
+        )
+        self.assertIn("尚未启用联网搜索", result["markdown"])
+        self.assertTrue(result["meta"]["external_research_required"])
 
     def test_search_and_business_question_compiles_to_alignment(self):
         state = SessionState()
@@ -256,6 +339,33 @@ class FollowupPlannerTest(unittest.TestCase):
 
 
 class FollowupToolTest(unittest.TestCase):
+    @patch("bot.tools.query_ec_followup_table.fetch_df")
+    def test_scalar_series_filter_does_not_use_leading_wildcard_sql(self, fetch):
+        fetch.return_value = pd.DataFrame([
+            {"product_title": "珀莱雅红宝石面霜", "gmv": 100},
+            {"product_title": "珀莱雅双抗精华", "gmv": 80},
+        ])
+        context = {
+            "source_brand": "PROYA", "input_brand": "珀莱雅",
+            "current_start": "2026-03-01", "current_end": "2026-03-31",
+            "prior_start": "2025-03-01", "prior_end": "2025-03-31",
+        }
+        result = _raw_rows(context, {"series": "红宝石"})
+        sql = fetch.call_args.args[0]
+        self.assertNotIn("LIKE CONCAT('%', :series, '%')", sql)
+        self.assertNotIn(":series", fetch.call_args.args[1])
+        self.assertEqual(result["product_title"].tolist(), ["珀莱雅红宝石面霜"])
+
+    def test_user_stated_growth_is_flagged_when_database_value_differs(self):
+        plan = type("Plan", (), {"metrics": ["spend_actual", "spend_evol"]})()
+        note = _input_metric_mismatch_note(
+            "为什么费用增长了+708.7%",
+            plan,
+            {"rows": [{"spend_evol": 7.959}]},
+        )
+        self.assertIn("+708.7%", note)
+        self.assertIn("+795.9%", note)
+
     def test_platform_fee_ratio_is_rejected_by_contract(self):
         state = SessionState()
         state.bet_context.brand, state.bet_context.period = "珀莱雅", "2026年3月"

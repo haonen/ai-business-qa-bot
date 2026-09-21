@@ -5,7 +5,7 @@ import os
 import re
 import calendar
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -106,25 +106,54 @@ def parse_period(period: str) -> dict[str, tuple[str, str]]:
 
 def parse_ec_period(period: str, default_year: int) -> dict[str, Any]:
     """Parse an EC analysis period without assuming a fixed analysis year."""
+    resolved_start = getattr(period, "start_date", None)
+    resolved_end = getattr(period, "end_date", None)
+    if resolved_start and resolved_end:
+        current_start = date.fromisoformat(resolved_start)
+        current_end = date.fromisoformat(resolved_end)
+        if current_end < current_start:
+            raise ValueError("结束日期不能早于开始日期。")
+        prior_start = date.fromisoformat(
+            getattr(period, "comparison_start", None) or _shift_date_year(current_start, -1).isoformat()
+        )
+        prior_end = date.fromisoformat(
+            getattr(period, "comparison_end", None) or _shift_date_year(current_end, -1).isoformat()
+        )
+        return {
+            "current_start": current_start.isoformat(),
+            "current_end": current_end.isoformat(),
+            "prior_start": prior_start.isoformat(),
+            "prior_end": prior_end.isoformat(),
+            "current_year": current_start.year,
+            "prior_year": prior_start.year,
+            "current_label": _period_label(current_start, current_end),
+            "prior_label": _period_label(prior_start, prior_end),
+            "raw": str(period),
+            "resolution_source": "entity_resolver_v2",
+        }
     raw = str(period or "").strip()
     if not raw:
         raise ValueError("缺少生意分析时间，请明确指定月份或日期区间。")
 
-    campaign = raw.replace("双十一", "双11")
-    campaign_year_match = re.fullmatch(r"(20\d{2})年?(618|520|双11)", campaign)
-    campaign_year = int(campaign_year_match.group(1)) if campaign_year_match else default_year
-    campaign_name = campaign_year_match.group(2) if campaign_year_match else campaign
-    campaign_windows = {
-        "618": ((5, 13), (6, 7)),
-        "520": ((5, 10), (5, 20)),
-        "双11": ((10, 24), (11, 11)),
-    }
-    if campaign_name in campaign_windows:
-        (sm, sd), (em, ed) = campaign_windows[campaign_name]
-        current_start = date(campaign_year, sm, sd)
-        current_end = date(campaign_year, em, ed)
+    to_date = _parse_to_date_range(raw, default_year)
+    if to_date:
+        current_start, current_end = to_date
     else:
-        current_start, current_end = _parse_ec_date_range(raw, default_year)
+        campaign = raw.replace("双十一", "双11")
+        campaign_year_match = re.fullmatch(r"(20\d{2})年?(618|520|双11)", campaign)
+        campaign_year = int(campaign_year_match.group(1)) if campaign_year_match else default_year
+        campaign_name = campaign_year_match.group(2) if campaign_year_match else campaign
+        campaign_windows = {
+            "618": ((5, 13), (6, 7)),
+            "520": ((5, 10), (5, 20)),
+            "双11": ((10, 24), (11, 11)),
+        }
+        if campaign_name in campaign_windows:
+            (sm, sd), (em, ed) = campaign_windows[campaign_name]
+            current_start = date(campaign_year, sm, sd)
+            current_end = date(campaign_year, em, ed)
+        else:
+            current_start, current_end = _parse_ec_date_range(raw, default_year)
 
     if current_end < current_start:
         raise ValueError("结束日期不能早于开始日期。")
@@ -143,7 +172,35 @@ def parse_ec_period(period: str, default_year: int) -> dict[str, Any]:
     }
 
 
+def _parse_to_date_range(
+    value: str, default_year: int, *, as_of_date: date | None = None,
+) -> tuple[date, date] | None:
+    raw = str(value or "").strip()
+    match = re.fullmatch(
+        r"(?:(20\d{2})年?\s*)?(YTD|MTD|年初至今|本月至今|今年以来)",
+        raw,
+        re.I,
+    )
+    if not match:
+        return None
+    year = int(match.group(1) or default_year)
+    marker = match.group(2).upper()
+    as_of = as_of_date or date.today()
+    try:
+        end = as_of.replace(year=year)
+    except ValueError:
+        end = as_of.replace(year=year, day=28)
+    if marker in {"YTD", "年初至今", "今年以来"}:
+        return date(year, 1, 1), end
+    return date(year, end.month, 1), end
+
+
 def _parse_ec_date_range(value: str, default_year: int) -> tuple[date, date]:
+    relative_days = {"今天": 0, "今日": 0, "昨天": -1, "昨日": -1, "前天": -2}
+    if value in relative_days:
+        selected = date.today() + timedelta(days=relative_days[value])
+        return selected, selected
+
     quarter = re.fullmatch(r"(?:(20\d{2})年?)?[Qq]([1-4])", value)
     if quarter:
         year = int(quarter.group(1) or default_year)
@@ -312,14 +369,44 @@ def clean_label(value: Any, fallback: str = "") -> str:
     return text or fallback
 
 
-def llm_client(*, max_retries: int = 2):
+def llm_client(*, max_retries: int = 1):
     from openai import OpenAI
 
-    return OpenAI(
+    from bot.timing import instrument_client
+    client = OpenAI(
         api_key=os.environ["DASHSCOPE_API_KEY"],
         base_url=os.environ.get("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         max_retries=max_retries,
+        timeout=float(os.environ.get("LLM_REQUEST_TIMEOUT", "30")),
     )
+
+    return instrument_client(client)
+
+
+def llm_model(role: str = "default") -> str:
+    """Resolve a role-specific model with one shared rollout fallback."""
+    env_name = {
+        "router": "DASHSCOPE_ROUTER_MODEL",
+        "plan": "DASHSCOPE_PLAN_MODEL",
+        "summary": "DASHSCOPE_SUMMARY_MODEL",
+        "default": "DASHSCOPE_MODEL",
+    }.get(role, "DASHSCOPE_MODEL")
+    return (
+        os.environ.get(env_name)
+        or os.environ.get("DASHSCOPE_MODEL")
+        or "glm-5.2"
+    )
+
+
+def llm_plan_extra_body() -> dict[str, Any]:
+    """Enable configurable reasoning only for semantic/analysis planning."""
+    effort = os.environ.get("DASHSCOPE_PLAN_REASONING_EFFORT", "high").strip().lower()
+    if effort in {"none", "off", "false", "0"}:
+        return {"enable_thinking": False}
+    allowed = {"minimal", "low", "medium", "high", "xhigh", "max"}
+    if effort not in allowed:
+        effort = "high"
+    return {"enable_thinking": True, "reasoning_effort": effort}
 
 
 def extract_json_object(text: str) -> dict:
@@ -335,9 +422,35 @@ def extract_json_object(text: str) -> dict:
 def detect_brand_hint(text: str) -> str | None:
     text = text.strip()
     cleaned = re.sub(r"^\s*(帮我|请|麻烦)?(分析一下|分析|看一下|看看|看|帮忙看一下)?\s*", "", text)
+    # This is the last-resort brand extractor, reached whenever none of the
+    # platform-specific gates (is_tmall/douyin/jd_business_question) matched
+    # the phrasing — which happens for any platform-qualified question that
+    # skips their narrower "生意/表现" hint words (e.g. "谷雨天猫618怎么样",
+    # "珀莱雅三平台卖了多少钱"). Unlike those gates' own route functions, this
+    # one never stripped the platform word itself, so it survived into the
+    # returned brand candidate.
+    cleaned = re.sub(
+        r"(?i)天猫|抖音|京东|三平台|全平台|tmall|douyin|jingdong|"
+        r"(?<![a-z])tm(?![a-z])|(?<![a-z])dy(?![a-z])|(?<![a-z])jd(?![a-z])",
+        " ", cleaned,
+    )
+    # Store-type suffixes ("欧莱雅官方旗舰店") are extremely common in how
+    # users name a brand in this domain but are not part of the brand name
+    # itself; unlike the platform words above they can sit in the middle of
+    # the sentence, not just where a platform word would.
+    cleaned = re.sub(r"官方旗舰店|海外旗舰店|全球旗舰店|旗舰店|专卖店|自营店|官方店", " ", cleaned)
 
     month_hint = normalize_period_hint(cleaned)
-    if month_hint and ("月" in month_hint or re.fullmatch(r"20\d{2}-\d{1,2}", month_hint)):
+    # Broaden beyond month-shaped periods to also take this split-based
+    # extraction for relative days ("昨天") and YTD/MTD, which used to fall
+    # through to the weaker fallback branches below. Campaign literals
+    # (618/双11/520) are deliberately excluded: the marker-loop further below
+    # already handles them correctly by trying the "before" substring as a
+    # standalone candidate first, which tolerates closing phrases this
+    # branch's split pattern doesn't cover ("咋样", a bare "期间" left
+    # between the literal and "的生意"). Routing them into this branch
+    # instead regressed cases like "林清轩618咋样" -> "林清轩咋样".
+    if month_hint and not re.fullmatch(r"(?:20\d{2}年?)?(?:618|双11|双十一|520)", month_hint):
         without_period = cleaned.replace(month_hint, " ")
         candidate = re.split(
             r"(?:的)?(?:生意|媒体投资|媒体表现|BET|bet|表现|怎么样|如何|分析|情况)",
@@ -393,6 +506,18 @@ def detect_brand_hint(text: str) -> str | None:
 
 def normalize_period_hint(text: str) -> str | None:
     text = text.strip()
+    relative_day = re.search(r"今天|今日|昨天|昨日|前天", text)
+    if relative_day:
+        return relative_day.group(0)
+    to_date = re.search(
+        r"(?:(20\d{2})年?\s*)?(YTD|MTD|年初至今|本月至今|今年以来)",
+        text,
+        re.I,
+    )
+    if to_date:
+        year, marker = to_date.groups()
+        normalized = marker.upper() if marker.upper() in {"YTD", "MTD"} else marker
+        return f"{year}年{normalized}" if year else normalized
     quarter = re.search(r"(?:(?:20\d{2})年?)?[Qq][1-4]", text)
     if quarter:
         return quarter.group(0)

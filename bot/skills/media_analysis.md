@@ -7,9 +7,11 @@ description: 生成品牌BET媒体投资飞书报告。用于媒体投资、BET�
 
 按用户指定期间生成完整飞书报告；单月问题的媒体与KOL看单月，Social Search看当年1月至该月。
 
+BET暂不支持按category拆分，只能分析整个品牌。用户要求某品类的BET时必须明确告知这一限制，不能把品牌整体花费标成该品类花费；不要为BET询问电商品类。整体文档末尾必须保留此remark。
+
 ## 固定流程
 
-1. 解析2026年分析月份，并生成去年同期。
+1. 解析2026年分析月份，并生成去年同期。`YTD`/“年初至今”从1月累计到当前月；`MTD`/“本月至今”按当前月处理，并由数据覆盖校验裁剪到最新可用月份。
 2. 在Search、Topline、KSI和EC Consolidation NSO数据源中分别解析品牌。
 3. 调用结构化查询Tool，不生成或执行任意SQL。
 4. 固定依次输出Media Investment、KOL Performance、Social Search三个部分。
@@ -32,7 +34,7 @@ description: 生成品牌BET媒体投资飞书报告。用于媒体投资、BET�
 - Media Investment、KOL Performance、Social Search使用H1，并依次编号1、2、3。
 - 各平台或一级分析主题使用H2；表格分析维度使用H3。
 - Category粒度明细必须使用Social Search下面的H2，不得与Social Search平级。
-- 不在正文展示内部品牌映射方式、数据覆盖月份或查询技术信息。
+- 不展示内部品牌映射方式。费比的remark必须说明缺失月份、原因及NSO纳入的category。
 
 ## 数据规则
 
@@ -51,8 +53,11 @@ description: 生成品牌BET媒体投资飞书报告。用于媒体投资、BET�
   - 京东：`Media=JD`。
 - 平台Wgt%使用平台交易花费除以Transaction花费；未覆盖的其他交易媒体仍保留在
   Transaction总额内，因此三个已拆分平台不要求合计为100%。
-- NSO读取`top_brands_total_ec`，按品牌和报告月份筛选`platform=TTL`后汇总
-  `Sales`；TTL记录已经是TM、DY、JD三平台合计，不再重复加总平台行。
+- NSO读取`top_brands_total_ec`：用统一品牌字典解析该表的全部已核验`Brand`值，按`year`/`month`筛选，**不筛选Platform**；汇总除`Total Beauty`（忽略大小写及首尾空格）外所有`Category`的`sales`。
+- 按用户确认口径，不自行合并或剔除Hair/haircare、含香/不含香等其他category；每个月的remark列出实际纳入的category原值。
+- 成功查表后，该月份有源数据而无该品牌记录：费比留空，remark写“该品牌在YYYY-MM未进入Top brands，因此无法计算费比”。
+- 整个月源数据缺失、仅有Total Beauty、sales为空或汇总不大于0、品牌映射不可用、SQL失败，均分别说明真实原因，不误称未进入Top brands。
+- 当前期、同期分别要求覆盖所有请求月份；任何一月不可用，整段对应NSO及费比留空。按月追问仍可计算有数月份的费比。同期缺数不阻断本期费比，但费比变化留空。
 - TTL媒体费比使用TTL花费乘1,000,000后除以TTL NSO；三个AIT类型分别使用
   对应花费乘1,000,000后除以同一个TTL NSO。
 - NSO Actual和NSO Evol%只在TTL行展示；AIT行只展示费比。

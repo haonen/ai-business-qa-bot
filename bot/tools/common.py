@@ -1,4 +1,5 @@
 from __future__ import annotations
+from bot.timing import timed, job_timed, sql_timed, span, event
 
 from pathlib import Path
 import json
@@ -10,20 +11,61 @@ from typing import Any
 import pandas as pd
 
 from bot.db.connection import fetch_df, fetch_one
+from bot.failures import (
+    AnalysisFailure, DATA_AFTER_LATEST, INFRASTRUCTURE_ERROR, INVALID_PERIOD,
+    NO_DATA_IN_RANGE, StructuredAnalysisError,
+)
 from bot.media_brand import resolve_source_brand
+from bot.brand_query import enabled as brand_gate_enabled, brand_predicate
+from bot.period_coverage import normalize_period_to_latest
 from bot.utils import DATA_DIR, clean_label, parse_ec_period, safe_div, safe_evol
 
 
 log = logging.getLogger(__name__)
 
 
+MIGRATED_BRAND_TOOLS = {
+    'query_ec_nso','query_ec_bet_monthly','query_three_platform_competitor','query_media_investment','query_bet_followup_table','query_social_search','query_kol_performance','query_douyin_business','query_douyin_followup_table','query_ecip_tmall_gmv','query_jd_business','query_tmall_gmv','query_category','query_driver','query_sku_list',
+    'query_series','query_scene_tag','query_compare','query_ec_followup_table',
+}
+
+
 def tool(fn=None, **_kwargs):
-    """Marker decorator. Registry exposes LangChain wrappers separately."""
-    return fn if fn is not None else (lambda f: f)
+    """Registry marker and opt-in migration boundary for brand-bearing tools."""
+    from functools import wraps
+    from inspect import signature
+    def decorate(function):
+        branded='brand' in signature(function).parameters
+        @wraps(function)
+        def guarded(*args,**kwargs):
+            if brand_gate_enabled() and branded and function.__name__ not in MIGRATED_BRAND_TOOLS:
+                return {'error':'brand_query_not_migrated','failure_kind':'BRAND_QUERY_NOT_MIGRATED',
+                        'message':'该查询尚未接入统一品牌字典，本次未执行旧查询。',
+                        'tool':function.__name__}
+            with span('tool.'+function.__name__):
+                return function(*args,**kwargs)
+        return guarded
+    return decorate(fn) if fn is not None else decorate
 
 
-class EcDataError(ValueError):
-    pass
+class EcDataError(StructuredAnalysisError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: str = INFRASTRUCTURE_ERROR,
+        requested_period: str | None = None,
+        latest_available_date: str | None = None,
+        retry_slot: str | None = None,
+    ):
+        super().__init__(AnalysisFailure(
+            failure_kind=failure_kind,
+            user_message=message,
+            requested_period=requested_period,
+            latest_available_date=latest_available_date,
+            retry_slot=retry_slot,
+            preserved_slots=("brand", "platform", "goals"),
+        ))
 
 
 _EC_CONTEXT_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
@@ -37,10 +79,17 @@ def ec_query_context(
 ) -> dict:
     cache_key = (str(brand or "").strip(), str(period or "").strip())
     cached = _EC_CONTEXT_CACHE.get(cache_key)
-    if cached and time.monotonic() - cached[0] < 300:
+    if not brand_gate_enabled() and cached and time.monotonic() - cached[0] < 300:
         return dict(cached[1])
 
-    resolved = resolve_source_brand(brand, "tmall", brand_aliases=brand_aliases)
+    mapped = brand_predicate(brand, 'ai_bot_tmall_product_link', 'brand_name') if brand_gate_enabled() else None
+    resolved = ({'brand': brand, 'match_method':'unified_dictionary'} if mapped else
+                resolve_source_brand(brand, "tmall", brand_aliases=brand_aliases))
+    def execute_one(sql, params):
+        if mapped:
+            sql=sql.replace('brand_name = :brand',mapped['sql'])
+            params={k:v for k,v in params.items() if k!='brand'} | mapped['params']
+        return fetch_one(sql,params)
     if resolved.get("error"):
         candidates = resolved.get("candidates") or []
         suffix = f" 可选品牌：{'、'.join(candidates)}。" if candidates else ""
@@ -54,10 +103,10 @@ def ec_query_context(
         list(brand_aliases or []),
     )
 
-    latest = fetch_one(
+    latest = execute_one(
         """
         SELECT CAST(bus_date AS DATE) AS max_date
-        FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+        FROM ai_bot_tmall_product_link
         WHERE brand_name = :brand
         ORDER BY CAST(bus_date AS DATE) DESC
         LIMIT 1
@@ -65,19 +114,41 @@ def ec_query_context(
         {"brand": source_brand},
     )
     if not latest.get("max_date"):
-        raise EcDataError(f"品牌“{brand}”在天猫商品链接数据中没有记录。")
+        from bot.brand_query import _scope
+        scope = _scope.get() if mapped else None
+        category = scope.category if scope else 'TTL'
+        label = {'HAIR':'洗护','SKIN':'护肤（非男士）','MEX':'男士','MAKEUP':'彩妆'}.get(category)
+        message = (f"品牌“{brand}”在天猫商品链接数据的{label}范围内没有记录，不代表该品牌其他品类没有销售。请换一个品类或选择全部生意。"
+                   if label else f"品牌“{brand}”在天猫商品链接数据中没有记录。")
+        raise EcDataError(message, failure_kind=NO_DATA_IN_RANGE, requested_period=str(period))
     max_date = str(latest["max_date"])
-    parsed = parse_ec_period(period, int(max_date[:4]))
+    try:
+        parsed = parse_ec_period(period, int(max_date[:4]))
+    except ValueError as exc:
+        raise EcDataError(
+            str(exc), failure_kind=INVALID_PERIOD,
+            requested_period=str(period), retry_slot="period",
+        ) from exc
 
-    if parsed["current_end"] > max_date:
+    parsed, adjustment = normalize_period_to_latest(parsed, max_date)
+    if mapped:
+        from bot.brand_query import validate_query_dates
+        validate_query_dates(parsed)
+    if parsed["current_start"] > max_date:
         raise EcDataError(
             f"当前品牌数据更新至{max_date}，"
-            f"你指定的本期为{parsed['current_start']}至{parsed['current_end']}，请重新指定时间。"
+            f"你指定的期间从{parsed['current_start']}开始，尚无可用数据。"
+            f"请提供不晚于{max_date}的新日期。",
+            failure_kind=DATA_AFTER_LATEST,
+            requested_period=str(period), latest_available_date=max_date,
+            retry_slot="period",
         )
-    current_exists = fetch_one(
+    if adjustment:
+        log.info("[ec_coverage] brand=%s adjustment=%s", source_brand, adjustment)
+    current_exists = execute_one(
         """
         SELECT 1 AS row_exists
-        FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+        FROM ai_bot_tmall_product_link
         WHERE brand_name = :brand
           AND CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
         LIMIT 1
@@ -89,11 +160,18 @@ def ec_query_context(
         },
     )
     if not current_exists.get("row_exists"):
-        raise EcDataError(f"品牌“{source_brand}”在本期没有商品链接数据，报告未生成。")
-    prior_exists = fetch_one(
+        raise EcDataError(
+            f"当前品牌数据更新至{max_date}，但品牌“{source_brand}”"
+            f"在{parsed['current_start']}至{parsed['current_end']}没有商品链接数据。"
+            "请改用有数据的日期，本次未生成报告。",
+            failure_kind=NO_DATA_IN_RANGE,
+            requested_period=str(period), latest_available_date=max_date,
+            retry_slot="period",
+        )
+    prior_exists = execute_one(
         """
         SELECT 1 AS row_exists
-        FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+        FROM ai_bot_tmall_product_link
         WHERE brand_name = :brand
           AND CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
         LIMIT 1
@@ -105,10 +183,16 @@ def ec_query_context(
         },
     )
     if not prior_exists.get("row_exists"):
-        raise EcDataError(f"品牌“{source_brand}”在去年同期没有商品链接数据，报告未生成。")
+        raise EcDataError(
+            f"品牌“{source_brand}”在去年同期没有商品链接数据，报告未生成。",
+            failure_kind=NO_DATA_IN_RANGE,
+            requested_period=str(period), latest_available_date=max_date,
+            retry_slot="period",
+        )
 
     context = {
         **parsed,
+        "brand_filter": mapped,
         "input_brand": brand,
         "source_brand": source_brand,
         "brand_match_method": resolved.get("match_method"),
@@ -138,7 +222,7 @@ def filter_sku(
         context["prior_end"],
     )
     cached = _EC_SKU_CACHE.get(cache_key)
-    if cached and time.monotonic() - cached[0] < 300:
+    if not brand_gate_enabled() and cached and time.monotonic() - cached[0] < 300:
         df = cached[1].copy(deep=True)
     else:
         sql = """
@@ -150,7 +234,7 @@ def filter_sku(
               key_driver,
               SUM(gmv) AS gmv,
               SUM(unit) AS unit
-            FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+            FROM ai_bot_tmall_product_link
             WHERE brand_name = :brand
               AND CAST(bus_date AS DATE) BETWEEN :current_start AND :current_end
             GROUP BY item_id, key_driver
@@ -165,7 +249,7 @@ def filter_sku(
               key_driver,
               SUM(gmv) AS gmv,
               SUM(unit) AS unit
-            FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+            FROM ai_bot_tmall_product_link
             WHERE brand_name = :brand
               AND CAST(bus_date AS DATE) BETWEEN :prior_start AND :prior_end
             GROUP BY item_id, key_driver
@@ -176,6 +260,10 @@ def filter_sku(
                 "current_start", "current_end", "prior_start", "prior_end"
             )},
         }
+        mapped=context.get('brand_filter')
+        if mapped:
+            sql=sql.replace('brand_name = :brand',mapped['sql'])
+            params={k:v for k,v in params.items() if k!='brand'} | mapped['params']
         df = fetch_df(sql, params)
         df.attrs["ec_context"] = context
         _EC_SKU_CACHE[cache_key] = (time.monotonic(), df.copy(deep=True))

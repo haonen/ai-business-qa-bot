@@ -1,12 +1,15 @@
 from __future__ import annotations
+from bot.brand_query import source_fetch, enabled as brand_gate_enabled
 
 import pandas as pd
 
 from bot.db.connection import fetch_df
 from bot.media_period import parse_media_period
+from bot.platforms import canonical_platform, platform_filter_sql
 from bot.tools.common import tool
 from bot.tools.followup_common import month_keys, standard_result
 from bot.tools.query_media_investment import _CHANNEL_RULES
+from bot.tools.query_ec_nso import query_ec_nso, BET_SCOPE_NOTE
 from bot.utils import safe_div, safe_evol
 
 
@@ -56,8 +59,8 @@ def _merge_rows(df: pd.DataFrame, dims: list[str], value_columns: list[str]) -> 
 
 
 def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tuple[list[dict], dict, dict]:
-    df = fetch_df(
-        """
+    df = source_fetch(fetch_df,'ai_bot_media_topline_investment','brand_r','brand_r = :brand',
+        f"""
         SELECT
           CASE WHEN CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
           CAST(period_month AS DATE) AS period_month, ait_roe AS ait, media, submedia,
@@ -81,26 +84,38 @@ def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tupl
     if filters.get("ait"):
         df = df[df["ait"].fillna("").astype(str).str.casefold() == str(filters["ait"]).casefold()]
     requested_platform = str(filters.get("platform") or "").casefold()
+    requested_commerce_platform = ""
+    if requested_platform:
+        try:
+            requested_commerce_platform = canonical_platform(
+                requested_platform, allow_ttl=False
+            )
+        except ValueError:
+            pass
     platform_breakdown = (
-        ("platform" in group_by or requested_platform in {"tmall", "douyin", "jd"})
+        ("platform" in group_by or requested_commerce_platform in {"TM", "DY", "JD"})
         and "bkfst" not in group_by
     )
     if platform_breakdown:
         transaction = raw[raw["ait"].fillna("").astype(str).str.casefold() == "transaction"].copy()
         parts = []
-        for key, label in (("tmall", "TMALL"), ("douyin", "Douyin"), ("jd", "JD")):
+        for key, label in (("tmall", "TM"), ("douyin", "DY"), ("jd", "JD")):
             rule = _CHANNEL_RULES[key]
             mask = [rule(str(m or "").strip().casefold(), str(s or "").strip().casefold()) for m, s in zip(transaction["media"], transaction["submedia"])]
             piece = transaction.loc[mask].copy()
             piece["platform"] = label
             parts.append(piece)
         df = pd.concat(parts, ignore_index=True) if parts else transaction.iloc[0:0]
-        if filters.get("platform") and str(filters["platform"]).casefold() not in {"red", "xiaohongshu"}:
-            df = df[df["platform"].str.casefold() == str(filters["platform"]).casefold()]
+        if requested_commerce_platform:
+            df = df[df["platform"] == requested_commerce_platform]
     bkfst_source_column = None
     if "bkfst" in group_by or filters.get("bkfst"):
         scope = str(filters.get("platform") or "overall").casefold()
-        column = "bkfs_xiaohongshu" if scope in {"red", "xiaohongshu"} else ("bkfs_douyin" if scope == "douyin" else "bkfs_overall")
+        try:
+            scope = canonical_platform(scope, allow_ttl=False, allow_red=True)
+        except ValueError:
+            scope = "OVERALL"
+        column = "bkfs_xiaohongshu" if scope == "RED" else ("bkfs_douyin" if scope == "DY" else "bkfs_overall")
         bkfst_source_column = column
         valid_bkfst = df[column].notna() & df[column].astype(str).str.strip().ne("")
         df = df[valid_bkfst].copy()
@@ -135,25 +150,9 @@ def _query_media(brand: str, parsed, group_by: list[str], filters: dict) -> tupl
     return rows, totals, coverage
 
 
-def _query_nso(brand: str, parsed) -> pd.DataFrame:
-    return fetch_df(
-        """
-        SELECT CASE WHEN year = :current_year THEN 'current' ELSE 'prior' END AS period_key,
-               year, month, SUM(Sales) AS nso, COUNT(*) AS row_count
-        FROM top_brands_total_ec
-        WHERE Brand = :brand AND platform = 'TTL'
-          AND ((year = :current_year AND month BETWEEN :current_start_month AND :current_end_month)
-            OR (year = :prior_year AND month BETWEEN :prior_start_month AND :prior_end_month))
-        GROUP BY period_key, year, month
-        """,
-        {"brand": brand, "current_year": int(parsed.focus_start[:4]), "prior_year": int(parsed.prior_start[:4]),
-         "current_start_month": int(parsed.focus_start[5:7]), "current_end_month": int(parsed.focus_end[5:7]),
-         "prior_start_month": int(parsed.prior_start[5:7]), "prior_end_month": int(parsed.prior_end[5:7])},
-    )
-
 
 def _query_search(brand: str, parsed, group_by: list[str]) -> tuple[list[dict], dict, dict]:
-    df = fetch_df(
+    df = source_fetch(fetch_df,'ai_bot_media_search_index','brand','brand=:brand',
         """
         SELECT CAST(report_month AS DATE) AS report_month, grain_level, category,
                current_search_index AS search_actual, previous_search_index AS search_prior,
@@ -179,7 +178,7 @@ def _query_search(brand: str, parsed, group_by: list[str]) -> tuple[list[dict], 
 
 
 def _query_kol(brand: str, parsed, group_by: list[str], filters: dict) -> tuple[list[dict], dict, dict]:
-    df = fetch_df(
+    df = source_fetch(fetch_df,'ai_bot_media_ksi_performance','brand','brand=:brand',
         """
         SELECT CASE WHEN CAST(period_month AS DATE) BETWEEN :focus_start AND :focus_end THEN 'current' ELSE 'prior' END AS period_key,
                CAST(period_month AS DATE) AS period_month, LOWER(platform) AS kol_platform, tier, kol_type,
@@ -202,7 +201,13 @@ def _query_kol(brand: str, parsed, group_by: list[str], filters: dict) -> tuple[
     df["month"] = df.apply(lambda r: _aligned_month(r["period_month"], r["period_key"]), axis=1)
     if filters.get("platform"):
         values = filters["platform"] if isinstance(filters["platform"], list) else [filters["platform"]]
-        normalized = {str(value).casefold() for value in values}
+        normalized = set()
+        for value in values:
+            try:
+                canonical = canonical_platform(value, allow_ttl=False, allow_red=True)
+                normalized.add("douyin" if canonical == "DY" else "red" if canonical == "RED" else canonical.casefold())
+            except ValueError:
+                normalized.add(str(value).casefold())
         df = df[df["kol_platform"].fillna("").astype(str).str.casefold().isin(normalized)]
     denominator_source = df.copy()
     for field in ("tier", "kol_type"):
@@ -237,9 +242,13 @@ def query_bet_followup_table(
     """Return a whitelisted BET follow-up table without accepting SQL fragments."""
     try:
         group_by, filters, metrics = list(group_by or []), dict(filters or {}), list(metrics or [])
+        if "category" in group_by or filters.get("category"):
+            return {"error": "unsupported_category", "message": BET_SCOPE_NOTE}
         _validate(group_by)
+        remarks = [BET_SCOPE_NOTE]
         parsed = parse_media_period(period)
-        source_brands = source_brands or {}
+        source_brands = ({key: brand for key in ("topline", "search", "ksi", "nso")}
+                         if brand_gate_enabled() else (source_brands or {}))
         family = "search" if any(m.startswith("search_") for m in metrics) else ("kol" if any(d in group_by for d in ("kol_platform", "tier", "kol_type", "kol")) or any(m.startswith(("cost_", "engage_", "cpe")) for m in metrics) else "media")
         source = {"search": "search", "kol": "ksi", "media": "topline"}[family]
         if source_brands and not source_brands.get(source):
@@ -277,18 +286,21 @@ def query_bet_followup_table(
                     },
                 }
             if any(m in metrics for m in ("nso_actual", "nso_evol", "fee_ratio", "fee_ratio_change")):
-                nso_brand = source_brands.get("nso")
-                nso = _query_nso(nso_brand, parsed) if nso_brand else pd.DataFrame()
-                nso_lookup = {}
-                for _, raw in nso.iterrows():
-                    month = f"{int(raw['year']) + (1 if raw['period_key'] == 'prior' else 0):04d}-{int(raw['month']):02d}"
-                    nso_lookup[(str(raw["period_key"]), month)] = float(raw["nso"] or 0)
+                nso_brand = source_brands.get("nso") or (brand if not source_brands else None)
+                nso = query_ec_nso(nso_brand, parsed.focus_start, parsed.focus_end,
+                                   parsed.prior_start, parsed.prior_end) if nso_brand else {
+                                       "error": "source_unavailable", "message": "NSO品牌映射不可用，费比留空。"}
+                remarks.extend(nso.get("remarks") or [nso.get("message", "")])
+                coverage["nso"] = nso.get("coverage", {})
                 for row in rows:
                     month = row.get("month")
-                    current_nso = nso_lookup.get(("current", month)) if month else sum(v for (kind, _), v in nso_lookup.items() if kind == "current")
-                    prior_nso = nso_lookup.get(("prior", month)) if month else sum(v for (kind, _), v in nso_lookup.items() if kind == "prior")
+                    prior_month = f"{int(month[:4])-1}{month[4:]}" if month else None
+                    current_nso = (nso.get("monthly", {}).get("current", {}).get(month, {}).get("nso")
+                                   if month else nso.get("nso_actual"))
+                    prior_nso = (nso.get("monthly", {}).get("prior", {}).get(prior_month, {}).get("nso")
+                                 if month else nso.get("nso_prior"))
                     row["nso_actual"] = current_nso
-                    row["nso_evol"] = safe_evol(current_nso, prior_nso) if prior_nso else None
+                    row["nso_evol"] = safe_evol(current_nso, prior_nso) if current_nso is not None and prior_nso else None
                     row["fee_ratio"] = safe_div(row.get("spend_actual"), current_nso)
                     prior_ratio = safe_div(row.get("spend_prior"), prior_nso)
                     row["fee_ratio_change"] = row["fee_ratio"] - prior_ratio if row["fee_ratio"] is not None and prior_ratio is not None else None
@@ -301,10 +313,12 @@ def query_bet_followup_table(
                     rows.append({"month": month, **{dim: "—" for dim in other_dims}})
             rows.sort(key=lambda row: (str(row.get("month") or ""), -float(row.get("spend_actual") or row.get("cost_actual") or row.get("search_actual") or 0)))
         rows = rows[:max(1, min(int(limit), 50))]
-        return standard_result(
-            query_meta={"domain": "bet", "family": family, "brand": brand, "matched_brand": matched_brand, "period": period, "group_by": group_by},
+        result = standard_result(
+            query_meta={"domain": "bet", "business_category": "TTL", "scope_note": "品牌整体BET，不按电商品类拆分", "family": family, "brand": brand, "matched_brand": matched_brand, "period": period, "group_by": group_by},
             filters=filters, totals=totals, rows=rows, coverage={**coverage, "requested_months": requested},
             missing=[m for m in requested if "month" in group_by and m not in present],
         )
+        result["remarks"] = remarks
+        return result
     except Exception as exc:
         return {"error": "execution_error", "message": str(exc)}

@@ -8,6 +8,8 @@ import re
 
 import pandas as pd
 
+from bot.utils import llm_client, llm_model
+
 _FORBIDDEN_WORDS = [
     "大盘", "行业", "竞品", "对手", "市场平均", "同行",
     "跑赢", "跑输", "领先", "落后于", "排名第", "全网",
@@ -20,17 +22,16 @@ try:
 except Exception:
     pass
 
-_SUMMARY_MODEL = "qwen-plus-latest"
-
-
 # ── 工具函数 ──────────────────────────────────────────────────
 
 def _llm_client():
-    from openai import OpenAI
-    return OpenAI(
-        api_key=os.environ["DASHSCOPE_API_KEY"],
-        base_url=os.environ.get("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-    )
+    return llm_client(max_retries=1)
+
+
+def _formatter_llm_enabled() -> bool:
+    """Legacy module prose is disabled when grounded Summary owns narration."""
+    legacy = os.environ.get("LEGACY_PIPELINE_EMERGENCY", "0").strip().lower()
+    return legacy in {"1", "true", "yes", "on"}
 
 
 def _short_category(name: str) -> str:
@@ -189,6 +190,8 @@ def _align_drilldown_marker(bullets: str, selected_short: str, selected_obj: dic
 
 
 def _gen_bullets(prompt: str, table_data: dict, fallback: str) -> str:
+    if not _formatter_llm_enabled():
+        return f"• {fallback}"
     client = _llm_client()
     extra = ""
     last_reason = ""
@@ -197,9 +200,10 @@ def _gen_bullets(prompt: str, table_data: dict, fallback: str) -> str:
             extra = f"\n上次生成的结论存在以下问题：{last_reason}，请重新生成。你只能基于下方给定的数据陈述事实，不能引入大盘/行业/竞品等未提供的对比维度，也不能使用表格之外的数字。"
         try:
             resp = client.chat.completions.create(
-                model=os.environ.get("DASHSCOPE_SUMMARY_MODEL", _SUMMARY_MODEL),
+                model=llm_model("summary"),
                 messages=[{"role": "user", "content": prompt + extra}],
                 max_tokens=150,
+                extra_body={"enable_thinking": False},
             )
             raw = resp.choices[0].message.content.strip()
             passed, reason = validate_conclusion(raw, table_data)
@@ -223,11 +227,14 @@ def _gen_bullets_loose(
     max_bullets: int = 3,
 ) -> str:
     """LLM bullets for richer qualitative synthesis; falls back deterministically."""
+    if not _formatter_llm_enabled():
+        return f"• {fallback}"
     try:
         resp = _llm_client().chat.completions.create(
-            model=model or os.environ.get("DASHSCOPE_SUMMARY_MODEL", _SUMMARY_MODEL),
+            model=model or llm_model("summary"),
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
+            extra_body={"enable_thinking": False},
         )
         raw = resp.choices[0].message.content.strip()
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
@@ -1044,9 +1051,12 @@ def format_report(
         coverage = f"；当前品牌数据更新至{period_meta['source_max_date']}"
     header = "\n".join([
         "数据来源：",
-        f"• 天猫品牌旗舰店链接：百库驾驶舱-天猫-商品-日表{coverage}。",
-        "• TTL GMV：ECIP MASS Pure Mass Market Ranking (TTL Beauty)，月表优先，日表补充未覆盖日期。",
+        "• 店铺GMV：百库驾驶舱；天猫_店铺排行_日表、天猫_店铺排行_月表。月表优先，日表补充未覆盖日期。",
+        f"• 品类及Key Driver分析：百库驾驶舱；天猫_商品_日表_2409至今{coverage}。",
     ])
+
+    if (ttl_result or {}).get('coverage', {}).get('monthly_unavailable_reason') == 'unverified_source':
+        header += "\n• 本品牌月表映射尚未核验，GMV及同比本次均采用已核验的店铺日表汇总。"
 
     category_parts = [
         render_module_category(category_result, selected_category, sku_result),

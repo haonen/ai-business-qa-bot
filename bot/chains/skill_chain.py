@@ -8,7 +8,7 @@ from bot.formatter import render_module_category, render_module_driver, render_m
 from bot.session import SessionState
 from bot.skills.loader import build_skill_prompt, load_narrative_config
 from bot.tools import query_category, query_driver, query_scene_tag, query_series, query_sku_list
-from bot.utils import llm_client, extract_json_object
+from bot.utils import llm_client, llm_model, extract_json_object
 from bot.chains.followup_v2_chain import run_followup_v2_chain
 
 
@@ -28,10 +28,11 @@ def dispatch_skill(followup_text: str, state: SessionState) -> dict:
 """
     try:
         resp = llm_client().chat.completions.create(
-            model="qwen-turbo",
+            model=llm_model("router"),
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
             max_tokens=80,
+            response_format={"type": "json_object"},
+            extra_body={"enable_thinking": False},
         )
         parsed = extract_json_object(resp.choices[0].message.content or "")
         if parsed:

@@ -5,7 +5,7 @@ import re
 from collections import defaultdict
 
 from bot.tools.common import filter_sku, load_function_tags, load_series_map, match_function_tag, split_periods, tool
-from bot.utils import llm_client, safe_div, safe_evol
+from bot.utils import llm_client, llm_model, safe_div, safe_evol
 
 
 def _series_keywords_for_brand(brand: str) -> dict[str, dict]:
@@ -56,10 +56,10 @@ def _llm_series_fallback(brand: str, titles: list[str]) -> list[dict]:
     )
     try:
         resp = llm_client().chat.completions.create(
-            model="qwen-plus",
+            model=llm_model("summary"),
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
             max_tokens=600,
+            extra_body={"enable_thinking": False},
         )
         raw = resp.choices[0].message.content or ""
         match = re.search(r"\[.*\]", raw, re.DOTALL)

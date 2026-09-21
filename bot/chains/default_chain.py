@@ -1,6 +1,8 @@
 from __future__ import annotations
+from bot.template_scope import scoped_template
 
 from bot.chains.adapters import attach_series_to_sku, build_fraud_result
+from bot.failures import failure_meta
 from bot.formatter import format_report
 from bot.tools import (
     query_category,
@@ -30,6 +32,7 @@ def select_drilldown_target(categories: list[dict]) -> str:
     return max(core, key=lambda c: ((c.get("weight") or 0), yoy_abs(c))).get("category_cn", "")
 
 
+@scoped_template('TM', whole_brand=False)
 def run_default_chain(
     brand: str,
     period: str,
@@ -54,11 +57,10 @@ def run_default_chain(
         return {
             "ok": False,
             "markdown": category_result.get("message", "品类分析失败"),
-            "meta": {
-                "brand": brand,
-                "period": period,
-                "document_ready": False,
-            },
+            "meta": failure_meta(
+                category_result, brand=brand, period=period,
+                platform="TM", domain="tmall_business",
+            ),
         }
 
     ttl_result = query_ecip_tmall_gmv(
@@ -70,11 +72,10 @@ def run_default_chain(
         return {
             "ok": False,
             "markdown": ttl_result.get("message", "ECIP MASS TTL GMV查询失败"),
-            "meta": {
-                "brand": brand,
-                "period": period,
-                "document_ready": False,
-            },
+            "meta": failure_meta(
+                ttl_result, brand=brand, period=period,
+                platform="TM", domain="tmall_business",
+            ),
         }
     category_result["overall_total"] = ttl_result.get("total") or {}
 

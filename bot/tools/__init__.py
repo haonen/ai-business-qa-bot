@@ -6,7 +6,7 @@ from bot.tools.query_driver import query_driver
 from bot.tools.query_ec_nso import query_ec_nso
 from bot.tools.query_ecip_tmall_gmv import query_ecip_tmall_gmv
 from bot.tools.query_kol_performance import query_kol_performance
-from bot.tools.query_media_investment import query_media_investment
+from bot.tools.query_media_investment import query_media_investment, latest_media_investment_month
 from bot.tools.query_scene_tag import query_scene_tag
 from bot.tools.query_social_search import query_social_search
 from bot.tools.query_series import query_series
@@ -16,6 +16,7 @@ from bot.tools.query_douyin_gmv import query_douyin_gmv
 from bot.tools.query_douyin_business import query_douyin_business
 from bot.tools.query_jd_business import query_jd_business
 from bot.tools.query_ec_followup_table import query_ec_followup_table
+from bot.tools.query_douyin_followup_table import query_douyin_followup_table
 from bot.tools.query_bet_followup_table import query_bet_followup_table
 from bot.tools.query_change_contribution import query_change_contribution
 from bot.tools.query_ec_bet_monthly import query_ec_bet_monthly
@@ -41,6 +42,7 @@ TOOL_REGISTRY = {
     "query_jd_business": query_jd_business,
     "query_kol_performance": query_kol_performance,
     "query_ec_followup_table": query_ec_followup_table,
+    "query_douyin_followup_table": query_douyin_followup_table,
     "query_bet_followup_table": query_bet_followup_table,
     "query_change_contribution": query_change_contribution,
     "query_ec_bet_monthly": query_ec_bet_monthly,

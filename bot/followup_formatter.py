@@ -265,8 +265,11 @@ def format_followup_result(plan: dict, result: dict) -> dict:
     tables = result.get("tables") or []
     brand = plan["brand"]
     period = plan["period"]["raw"]
-    scope = f"范围：{brand}，{period}。"
-    parts = [scope]
+    platform_label = {"TM": "天猫", "DY": "抖音", "JD": "京东", "TTL": "三平台"}.get(
+        str(plan.get("platform") or "").upper(), ""
+    )
+    scope = f"范围：{brand}，{period}" + (f"，{platform_label}。" if platform_label else "。")
+    parts = []
     if plan["skill"] == "analysis_drill":
         bundle_bullets = _ec_drill_bullets(plan, rows, tables)
         bullets = bundle_bullets
@@ -277,7 +280,12 @@ def format_followup_result(plan: dict, result: dict) -> dict:
         if tables and not bundle_bullets:
             for table in tables:
                 bullets.extend(_analysis_bullets(table.get("rows") or [], "performance")[:1])
-        parts.extend(f"- {line}" for line in bullets[:3])
+        if bullets:
+            parts.append(f"先回答你的问题：{bullets[0]}")
+        parts.append(scope)
+        parts.extend(f"- {line}" for line in bullets[1:3])
+    else:
+        parts.append(scope)
     if rows:
         parts.append(_table(rows, plan.get("metrics") or []))
     for table in tables:
@@ -288,6 +296,7 @@ def format_followup_result(plan: dict, result: dict) -> dict:
         or any(table.get("title") == "系列结构" for table in tables)
     ):
         parts.append("_产品系列由AI根据产品链接归纳总结，存在误差。_")
+    parts.extend("> **Remark**：" + note for note in result.get("remarks", []) if note)
     row_count = len(rows) + sum(len(table.get("rows") or []) for table in tables)
     table_count = (1 if rows else 0) + len(tables)
     # A drill bundle is designed as a small report. Even one detailed sub-table

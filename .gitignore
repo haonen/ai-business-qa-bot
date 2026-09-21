@@ -6,6 +6,7 @@ credentials*.env
 .venv/
 __pycache__/
 *.pyc
+bot/.main.py.lock
 .DS_Store
 *.xlsx
 ~$*.xlsx
@@ -15,6 +16,20 @@ data_import/data/*.parquet
 data_import/data/*.csv
 data_import/data/*.xlsx
 data_import/output/
+
+# Generated reports, transient runtime state, and server-side backups.
+output/
+tmp/
+backups/
+logs/
+runtime/
+*.log
+*.pid
+*.db
+*.sqlite
+*.sqlite3
+bot/.recent_requests.json
+bot/.recent_requests.lock
 
 # Operational access notes may contain server or database credentials.
 docs/*access*.md

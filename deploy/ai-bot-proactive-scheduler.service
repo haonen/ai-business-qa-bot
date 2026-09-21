@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Business QA Bot Proactive Card Scheduler
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ai-business-qa-bot
+EnvironmentFile=/root/ai-business-qa-bot/.env
+Environment=BOT_PROACTIVE_QUEUE_NAME=ai-bot-proactive
+ExecStart=/root/ai-business-qa-bot/.venv/bin/rq worker --with-scheduler ${BOT_PROACTIVE_QUEUE_NAME}
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import re
 
 from bot.media_period import normalize_media_period_hint
+from bot.platforms import canonical_platform
 
 
 SEGMENT_ALIASES = {
@@ -11,15 +12,27 @@ SEGMENT_ALIASES = {
     "TOTAL BEAUTY MARKET": "BEAUTY MARKET", "TOTAL BEAUTY": "BEAUTY MARKET",
     "整体美妆市场": "BEAUTY MARKET", "美妆全市场": "BEAUTY MARKET",
     "PURE MASS": "PURE MASS", "PUREMASS": "PURE MASS", "PURE-MASS": "PURE MASS",
+    "MASS": "PURE MASS",
     "大众": "PURE MASS", "大众美妆": "PURE MASS", "纯大众": "PURE MASS",
     "SELECTIVE": "SELECTIVE", "高端": "SELECTIVE", "高端美妆": "SELECTIVE",
     "PROFESSIONAL": "PROFESSIONAL", "专业": "PROFESSIONAL", "专业美妆": "PROFESSIONAL",
+}
+CATEGORY_ALIASES = {
+    "TTL BEAUTY": "TOTAL BEAUTY", "TOTAL BEAUTY": "TOTAL BEAUTY",
+    "MASS BEAUTY": "TOTAL BEAUTY",
+    "全美妆": "TOTAL BEAUTY", "美妆全品类": "TOTAL BEAUTY",
+    "FEMALE SKINCARE": "FEMALE SKINCARE", "女士护肤": "FEMALE SKINCARE",
+    "女护肤": "FEMALE SKINCARE", "护肤": "FEMALE SKINCARE",
+    "MAKEUP": "MAKEUP", "彩妆": "MAKEUP",
+    "HAIR": "HAIR", "HAIRCARE": "HAIR", "美发": "HAIR", "护发": "HAIR",
+    "MALE SKINCARE": "MALE SKINCARE", "MEX": "MALE SKINCARE",
+    "男士护肤": "MALE SKINCARE", "男护肤": "MALE SKINCARE",
 }
 PLATFORM_ALIASES = {
     "TTL": "TTL", "三平台": "TTL", "全平台": "TTL", "整体": "TTL",
     "TM": "TM", "TMALL": "TM", "天猫": "TM",
     "DY": "DY", "DOUYIN": "DY", "抖音": "DY",
-    "JD": "JD", "京东": "JD",
+    "JD": "JD", "JINGDONG": "JD", "京东": "JD",
 }
 MARKET_HINTS = (
     "大盘", "市场整体", "整体市场", "市场涨跌", "市场趋势",
@@ -33,9 +46,12 @@ class MarketPlan:
     period: str | None
     segment: str = "PURE MASS"
     platform: str = "TTL"
+    category: str = "TOTAL BEAUTY"
     view: str = "summary"
     ranking_metric: str = "gmv_actual"
     ranking_limit: int = 5
+    include_bet: bool = False
+    bet_latest_ytd: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -68,22 +84,48 @@ def normalize_segment(value: str | None, text: str = "") -> str:
     return "PURE MASS"
 
 
+def explicit_segment(text: str) -> str | None:
+    combined = str(text or "").upper().replace("_", " ")
+    for alias, canonical in SEGMENT_ALIASES.items():
+        if alias.upper() == "TOTAL BEAUTY":
+            continue
+        if alias.upper() in combined:
+            return canonical
+    return None
+
+
+def explicit_category(text: str) -> str | None:
+    combined = str(text or "").upper().replace("_", " ").replace("TOTAL BEAUTY MARKET", "")
+    for alias, canonical in CATEGORY_ALIASES.items():
+        if alias.upper() in combined:
+            return canonical
+    return None
+
+
+def normalize_category(value: str | None, text: str = "") -> str:
+    return explicit_category(text) or explicit_category(value or "") or "TOTAL BEAUTY"
+
+
 def normalize_platform(value: str | None, text: str = "") -> str:
     combined = f"{value or ''} {text}".upper().strip()
     # Explicit platform names beat generic words such as “整体”.
-    for alias in ("天猫", "TMALL", "TM", "抖音", "DOUYIN", "DY", "京东", "JD"):
+    for alias in ("天猫", "TMALL", "TM", "抖音", "DOUYIN", "DY", "京东", "JINGDONG", "JD"):
         if alias.upper() in combined:
             return PLATFORM_ALIASES[alias]
     for alias, canonical in PLATFORM_ALIASES.items():
         if alias.upper() in combined:
             return canonical
+    try:
+        return canonical_platform(value)
+    except ValueError:
+        pass
     return "TTL"
 
 
 def explicit_platform(text: str) -> str | None:
     """Return only a platform explicitly written in the current user turn."""
     combined = str(text or "").upper()
-    for alias in ("天猫", "TMALL", "TM", "抖音", "DOUYIN", "DY", "京东", "JD"):
+    for alias in ("天猫", "TMALL", "TM", "抖音", "DOUYIN", "DY", "京东", "JINGDONG", "JD"):
         if alias.upper() in combined:
             return PLATFORM_ALIASES[alias]
     for alias in ("三平台", "全平台", "TTL"):
@@ -98,6 +140,7 @@ def build_market_plan(
     period: str | None = None,
     segment: str | None = None,
     platform: str | None = None,
+    category: str | None = None,
     intent: str | None = None,
     view: str | None = None,
     ranking_metric: str | None = None,
@@ -151,6 +194,7 @@ def build_market_plan(
         period=period or normalize_media_period_hint(value),
         segment=normalize_segment(segment, value),
         platform=resolved_platform,
+        category=normalize_category(category, value),
         view=resolved_view,
         ranking_metric=resolved_metric,
         ranking_limit=resolved_limit,

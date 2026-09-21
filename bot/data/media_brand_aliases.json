@@ -1,3 +1,24 @@
 {
-  "aliases": {}
+  "aliases": {
+    "美宝莲": {
+      "dy": "美宝莲",
+      "three_platform_store_rank_monthly": "Maybelline"
+    },
+    "maybelline": {
+      "dy": "美宝莲",
+      "three_platform_store_rank_monthly": "Maybelline"
+    },
+    "谷雨": {
+      "search": "谷雨",
+      "topline": "GRAIN RAIN",
+      "ksi": "GRAIN RAIN",
+      "nso": "GUYU"
+    },
+    "guyu": {
+      "search": "谷雨",
+      "topline": "GRAIN RAIN",
+      "ksi": "GRAIN RAIN",
+      "nso": "GUYU"
+    }
+  }
 }

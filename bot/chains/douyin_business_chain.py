@@ -1,9 +1,14 @@
 from __future__ import annotations
+from bot.template_scope import scoped_template
+
+import os
 
 from bot.douyin_business_formatter import format_douyin_business_report
+from bot.failures import failure_meta
 from bot.tools.query_douyin_business import query_douyin_business
 
 
+@scoped_template('DY', whole_brand=False)
 def run_douyin_business_chain(
     brand: str,
     period: str,
@@ -16,8 +21,14 @@ def run_douyin_business_chain(
             "markdown": "请明确需要分析的时间段。",
             "meta": {"brand": brand, "period": None, "document_ready": False},
         }
+    product_v2 = os.environ.get("DOUYIN_PRODUCT_DAILY_V2_ENABLED", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     if on_progress:
-        on_progress("正在汇总抖音品牌GMV和四级类目…")
+        if product_v2:
+            on_progress("正在汇总抖音店铺整体GMV，并检查商品日表质量…")
+        else:
+            on_progress("正在汇总抖音品牌GMV和四级类目…")
     result = query_douyin_business(
         brand=brand,
         period=period,
@@ -27,15 +38,16 @@ def run_douyin_business_chain(
         return {
             "ok": False,
             "markdown": result.get("message") or "抖音品牌生意分析失败。",
-            "meta": {
-                "brand": brand,
-                "period": period,
-                "document_ready": False,
-                "domain": "douyin_business",
-            },
+            "meta": failure_meta(
+                result, brand=brand, period=period,
+                platform="DY", domain="douyin_business",
+            ),
         }
     if on_progress:
-        on_progress("已完成类目下钻，正在整理渠道、产品系列和Top 5链接…")
+        if product_v2:
+            on_progress("商品日表质检已通过，正在整理品类、系列、Key Driver和Top商品…")
+        else:
+            on_progress("已完成品牌及类目汇总，正在整理品牌级渠道表现…")
     markdown = format_douyin_business_report(result)
     return {
         "ok": True,

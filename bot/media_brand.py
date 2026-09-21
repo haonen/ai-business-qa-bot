@@ -10,7 +10,9 @@ import re
 import unicodedata
 
 from bot.db.connection import fetch_df, fetch_one, get_engine
-from bot.utils import extract_json_object, llm_client
+from bot.brand_reference import english_brand_for_chinese
+from bot.platforms import platform_filter_sql
+from bot.utils import extract_json_object, llm_client, llm_model
 
 
 SOURCES = ("search", "topline", "ksi", "tmall", "dy")
@@ -53,6 +55,15 @@ def _load_aliases() -> dict:
         return {}
     data = json.loads(_ALIAS_PATH.read_text(encoding="utf-8"))
     return data.get("aliases", data) if isinstance(data, dict) else {}
+
+
+def _verified_aliases(user_brand: str) -> dict[str, str]:
+    entries = _load_aliases()
+    entry = entries.get(user_brand) or entries.get(normalize_brand(user_brand)) or {}
+    if not isinstance(entry, dict):
+        return {}
+    return {source: str(entry[source]).strip() for source in entry.get("verified_sources", [])
+            if source in LOOKUP_SOURCES and entry.get(source)}
 
 
 def _complete_mapping(mapping: dict[str, str | None]) -> ResolvedBrands | None:
@@ -332,7 +343,7 @@ def _tmall_exact_fact_candidates(values: tuple[str, ...]) -> tuple[str, ...]:
     df = fetch_df(
         f"""
         SELECT DISTINCT brand_name AS source_brand
-        FROM ai_bot_tmall_product_link FORCE INDEX (idx_tmall_brand_date)
+        FROM ai_bot_tmall_product_link
         WHERE brand_name IN ({placeholders})
         ORDER BY brand_name
         LIMIT 10
@@ -353,9 +364,11 @@ def _tmall_exact_fact_candidates(values: tuple[str, ...]) -> tuple[str, ...]:
 @lru_cache(maxsize=256)
 def _generate_brand_variants(user_brand: str) -> tuple[str, ...]:
     variants = [user_brand]
-    if not os.environ.get("DASHSCOPE_API_KEY"):
-        return tuple(variants)
-    prompt = f"""
+    reference_english = english_brand_for_chinese(user_brand)
+    if reference_english:
+        variants.append(reference_english)
+    if os.environ.get("DASHSCOPE_API_KEY"):
+        prompt = f"""
 为品牌“{user_brand}”生成数据库检索名称，最多8个。
 必须尽量同时给出该品牌真实的官方中文名与官方英文/罗马字品牌名：
 用户输入中文时补充英文名，用户输入英文时补充中文名。
@@ -363,21 +376,22 @@ def _generate_brand_variants(user_brand: str) -> tuple[str, ...]:
 不要加入母公司、集团名或其他子品牌。
 只返回JSON：{{"variants":["名称1","名称2"]}}
 """
-    try:
-        response = llm_client(max_retries=0).chat.completions.create(
-            model=os.environ.get("DASHSCOPE_ROUTER_MODEL", "qwen3.7-plus"),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=160,
-            timeout=float(os.environ.get("MEDIA_BRAND_LLM_TIMEOUT", "12")),
-        )
-        parsed = extract_json_object(response.choices[0].message.content or "")
-        for value in parsed.get("variants") or []:
-            value = str(value or "").strip()
-            if value and len(value) <= 80:
-                variants.append(value)
-    except Exception as exc:
-        log.warning("[media_brand] variant generation failed for %s: %s", user_brand, exc)
+        try:
+            response = llm_client(max_retries=0).chat.completions.create(
+                model=llm_model("router"),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=160,
+                timeout=float(os.environ.get("MEDIA_BRAND_LLM_TIMEOUT", "12")),
+                response_format={"type": "json_object"},
+                extra_body={"enable_thinking": False},
+            )
+            parsed = extract_json_object(response.choices[0].message.content or "")
+            for value in parsed.get("variants") or []:
+                value = str(value or "").strip()
+                if value and len(value) <= 80:
+                    variants.append(value)
+        except Exception as exc:
+            log.warning("[media_brand] variant generation failed for %s: %s", user_brand, exc)
     unique = []
     seen = set()
     for value in variants:
@@ -386,6 +400,44 @@ def _generate_brand_variants(user_brand: str) -> tuple[str, ...]:
             unique.append(value)
             seen.add(key)
     return tuple(unique[:8])
+
+
+def generate_brand_variants(user_brand: str) -> tuple[str, ...]:
+    """Return safe lookup variants for source-specific fact-table validation."""
+    user_brand = str(user_brand or "").strip()
+    if not user_brand:
+        return ()
+    aliases = _load_aliases()
+    alias_entry = aliases.get(user_brand) or aliases.get(normalize_brand(user_brand)) or {}
+    configured = tuple(alias_entry.values()) if isinstance(alias_entry, dict) else ()
+    reference_english = english_brand_for_chinese(user_brand)
+    raw_variants = (
+        (user_brand, *configured, reference_english)
+        if configured
+        else _generate_brand_variants(user_brand)
+    )
+    values = []
+    seen = set()
+    for raw in raw_variants:
+        value = str(raw or "").strip()
+        key = normalize_brand(value)
+        if key and key not in seen:
+            values.append(value)
+            seen.add(key)
+    return tuple(values)
+
+
+def configured_brand_alias(user_brand: str, source_or_table: str) -> str | None:
+    """Return an explicit source/table alias without invoking a model or database."""
+    user_brand = str(user_brand or "").strip()
+    if not user_brand:
+        return None
+    aliases = _load_aliases()
+    alias_entry = aliases.get(user_brand) or aliases.get(normalize_brand(user_brand)) or {}
+    if not isinstance(alias_entry, dict):
+        return None
+    value = str(alias_entry.get(source_or_table) or "").strip()
+    return value or None
 
 
 def _validate_selected_brand(value: str, candidates: tuple[str, ...]) -> str | None:
@@ -417,11 +469,12 @@ def _select_source_mappings(
 """
     try:
         response = llm_client(max_retries=0).chat.completions.create(
-            model=os.environ.get("DASHSCOPE_ROUTER_MODEL", "qwen3.7-plus"),
+            model=llm_model("router"),
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
             max_tokens=260,
             timeout=float(os.environ.get("MEDIA_BRAND_LLM_TIMEOUT", "12")),
+            response_format={"type": "json_object"},
+            extra_body={"enable_thinking": False},
         )
         parsed = extract_json_object(response.choices[0].message.content or "")
     except Exception as exc:
@@ -452,6 +505,12 @@ def resolve_media_brand(
     user_brand: str,
     brand_aliases: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
+    from bot.brand_query import enabled as brand_gate_enabled
+    if brand_gate_enabled():
+        results={source:resolve_source_brand(user_brand,source,brand_aliases) for source in ('search','topline','ksi')}
+        return {'input':user_brand,'resolved':{k:None if v.get('error') else user_brand for k,v in results.items()},
+                'missing_sources':[k for k,v in results.items() if v.get('error')],
+                'match_methods':{k:'unified_per_table' for k in results},'candidates':{}}
     user_brand = str(user_brand or "").strip()
     normalized_input = normalize_brand(user_brand)
     if not normalized_input:
@@ -459,10 +518,13 @@ def resolve_media_brand(
 
     cached = _read_resolution_cache(normalized_input)
     if cached:
+        verified = _verified_aliases(user_brand)
+        resolved = cached.by_source()
+        resolved.update({k: v for k, v in verified.items() if k in SOURCES})
         return {
             "input": user_brand,
-            "resolved": cached.by_source(),
-            "match_methods": {source: "cache" for source in SOURCES},
+            "resolved": resolved,
+            "match_methods": {source: "verified_alias" if source in verified else "cache" for source in SOURCES},
         }
 
     aliases = _load_aliases()
@@ -517,11 +579,15 @@ def resolve_media_brand(
     ambiguous: dict[str, list[str]] = {}
     confidence = 1.0
     if missing_sources:
-        variants = (
-            tuple(supplied_names)
-            if len(supplied_names) > 1
-            else _generate_brand_variants(user_brand)
-        )
+        reference_english = english_brand_for_chinese(user_brand)
+        # Router/entity aliases are useful candidates, but they must not
+        # suppress source-specific variants. For example 谷雨's generic EC
+        # name is GUYU while Topline/KSI use GRAIN RAIN.
+        variants = tuple(dict.fromkeys((
+            *supplied_names,
+            *_generate_brand_variants(user_brand),
+            *((reference_english,) if reference_english else ()),
+        )))
         normalized_variants = tuple(normalize_brand(value) for value in variants)
         candidate_rows = _dictionary_rows(
             normalized_variants,
@@ -533,7 +599,12 @@ def resolve_media_brand(
             values = grouped.get(source) or ()
             if len(values) == 1:
                 resolved[source] = values[0]
-                methods[source] = "dictionary_unique_alias"
+                methods[source] = (
+                    "cn_en_reference"
+                    if reference_english
+                    and normalize_brand(values[0]) == normalize_brand(reference_english)
+                    else "dictionary_unique_alias"
+                )
         missing_sources = tuple(source for source in SOURCES if not resolved[source])
         no_candidates = [source for source in missing_sources if not grouped.get(source)]
         for source in no_candidates:
@@ -583,7 +654,47 @@ def resolve_media_brand(
     }
 
 
-def resolve_source_brand(
+def resolve_source_brand(user_brand, source, brand_aliases=None):
+    """Existing resolver, optionally compared with the unified mapping in shadow mode."""
+    from bot.brand_query import enabled as brand_gate_enabled
+    if brand_gate_enabled():
+        from bot.brand_lookup_runtime import get_brand_lookup
+        specs={'nso':('top_brands_total_ec','Brand'),'tmall':('ai_bot_tmall_product_link','brand_name'),'dy':('ai_bot_dy_product_link','商品品牌'),
+               'topline':('ai_bot_media_topline_investment','brand_r'),'search':('ai_bot_media_search_index','brand'),
+               'ksi':('ai_bot_media_ksi_performance','brand')}
+        if source not in specs:return {'error':'source_unavailable','message':'该数据源尚未接入统一查询。'}
+        lookup=get_brand_lookup()
+        if lookup is None:return {'error':'dictionary_disabled','message':'统一品牌字典未启用。'}
+        table,field=specs[source];plan=lookup.plan(user_brand,'TTL',table,field)
+        if plan.get('status')!='ready':return {'error':plan.get('status'),'message':'目标表品牌映射不可用。'}
+        return {'brand':user_brand,'source_values':plan['values'],'brand_id':plan['brand_id'],
+                'match_method':'unified_per_table','input':user_brand,'source':source}
+    from bot.brand_source_binding import binding
+    tables = {"tmall":"ai_bot_tmall_product_link", "dy":"ai_bot_dy_product_link",
+              "topline":"ai_bot_media_topline_investment", "search":"ai_bot_media_search_index",
+              "ksi":"ai_bot_media_ksi_performance"}
+    mapped = binding(user_brand, tables[source]) if source in tables else None
+    if mapped is not None:
+        if mapped.get("error"):
+            result = mapped
+        elif len(mapped["values"]) != 1:
+            result = {"error":"multiple_source_values", **mapped}
+        else:
+            result = {"input":user_brand,"source":source,"brand":mapped["values"][0], **mapped}
+    else:
+        result = _resolve_source_brand_legacy(user_brand, source, brand_aliases)
+    if os.environ.get("BRAND_MAPPING_SHADOW_FILE"):
+        try:
+            from bot.brand_mapping_shadow import inspect
+            comparison = inspect(user_brand, source, result)
+            log.info("[brand_mapping_shadow] %s", json.dumps(comparison, ensure_ascii=False))
+        except Exception as exc:
+            # A comparison failure must not alter existing queries or results.
+            log.warning("[brand_mapping_shadow] comparison failed: %s", type(exc).__name__)
+    return result
+
+
+def _resolve_source_brand_legacy(
     user_brand: str,
     source: str,
     brand_aliases: list[str] | tuple[str, ...] | None = None,
@@ -601,6 +712,11 @@ def resolve_source_brand(
         value = str(value or "").strip()
         if value and value not in supplied:
             supplied.append(value)
+
+    verified = _verified_aliases(user_brand)
+    if source in verified:
+        return {"input": user_brand, "source": source, "brand": verified[source],
+                "match_method": "verified_alias"}
 
     cache_key = (source, normalized_input)
     source_cached = _read_source_resolution_cache(normalized_input, source)
@@ -735,12 +851,25 @@ def resolve_source_brand(
             "candidates": list(exact[:5]),
         }
 
-    variants = tuple(supplied) if len(supplied) > 1 else _generate_brand_variants(user_brand)
+    reference_english = english_brand_for_chinese(user_brand)
+    reference_values = (reference_english,) if reference_english else ()
+    variants = tuple(dict.fromkeys((
+        *supplied,
+        *_generate_brand_variants(user_brand),
+        *reference_values,
+    )))
     variant_values = tuple(normalize_brand(value) for value in variants if normalize_brand(value))
     candidates = _group_candidates(
         _dictionary_rows(variant_values, (source,), include_prefix=True)
     ).get(source) or ()
-    match_method = "dictionary_unique_alias"
+    match_method = (
+        "cn_en_reference"
+        if reference_english and any(
+            normalize_brand(value) == normalize_brand(reference_english)
+            for value in candidates
+        )
+        else "dictionary_unique_alias"
+    )
     if not candidates and source == "tmall":
         try:
             candidates = _tmall_exact_fact_candidates(variants)
@@ -811,10 +940,10 @@ def latest_common_month(resolved: dict[str, str | None]) -> str | None:
             FROM ai_bot_media_ksi_performance
             WHERE year = 2026 AND brand = :brand
         """,
-        "nso": """
+        "nso": f"""
             SELECT DISTINCT CONCAT(year, '-', LPAD(month, 2, '0'), '-01') AS month_value
             FROM top_brands_total_ec
-            WHERE year = 2026 AND platform = 'TTL' AND Brand = :brand
+            WHERE year = 2026 AND LOWER(TRIM(Category)) <> 'total beauty' AND Brand = :brand
         """,
     }
     common: set[str] | None = None
@@ -822,7 +951,11 @@ def latest_common_month(resolved: dict[str, str | None]) -> str | None:
         brand = resolved.get(source)
         if not brand:
             continue
-        df = fetch_df(sql, {"brand": brand})
+        if source == "nso":
+            from bot.brand_query import source_fetch
+            df = source_fetch(fetch_df, "top_brands_total_ec", "Brand", "Brand = :brand", sql, {"brand": brand})
+        else:
+            df = fetch_df(sql, {"brand": brand})
         values = {
             str(value)[:10]
             for value in (df["month_value"].dropna().tolist() if not df.empty else [])

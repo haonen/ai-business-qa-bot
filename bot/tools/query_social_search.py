@@ -1,4 +1,5 @@
 from __future__ import annotations
+from bot.brand_query import source_fetch, enabled as brand_gate_enabled
 
 import pandas as pd
 
@@ -19,7 +20,7 @@ def _requested_months(start_month: str, end_month: str) -> list[str]:
 def query_social_search(brand: str, start_month: str, end_month: str) -> dict:
     """查询指定品牌从年初到结束月的Social Search品牌月度和Category明细。"""
     try:
-        df = fetch_df(
+        df = source_fetch(fetch_df,'ai_bot_media_search_index','brand','brand = :brand',
             """
             SELECT
                 CAST(report_month AS DATE) AS report_month,
@@ -99,6 +100,8 @@ def query_social_search(brand: str, start_month: str, end_month: str) -> dict:
             })
 
         return {
+            "business_category": "TTL",
+            "scope_note": "品牌整体BET，不按电商品类拆分",
             "brand": brand,
             "date_range": {"start": start_month, "end": end_month},
             "monthly": monthly,

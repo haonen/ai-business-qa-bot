@@ -19,3 +19,5 @@ description: Analyze focused EC, BET, or EC×BET follow-up questions about perfo
 12. When series uses AI inference, append: `产品系列由AI根据产品链接归纳总结，存在误差。`
 13. Render missing values as `—`; do not convert missing data to zero.
 14. Treat media fee ratio, Take Rate, TR, and BET% as the same KPI. If media spend and fee ratio are both requested, retain both in the evidence table.
+15. Internal KPI movement can establish scale, direction, mix, and alignment, but cannot prove a company's campaign, endorsement, product-launch, or media strategy. When external evidence is unavailable, state that boundary explicitly instead of inventing a causal story.
+16. If a percentage stated by the user differs from the same KPI returned by the current query, surface the mismatch before analysis and use the queried value; do not silently replace one number with another.
