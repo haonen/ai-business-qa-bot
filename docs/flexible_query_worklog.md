@@ -4,10 +4,10 @@
 
 ## 当前进度
 
-截至 2026-09-21：已整理开发规格；尚未按新规格执行功能开发或验收。本文件不把此前会话讨论、排期或环境操作推断为已通过验收。
+截至 2026-09-21：已整理开发规格，并在生产 ECS 上建立了未启用业务入口的隔离 staging 骨架。测试飞书应用、只读数据库账号与模型凭据尚未配置，因此 D21 仍为“部分完成，待端到端验证”，不视为功能已验收。
 
 |任务|计划日期|状态|证据 / 下一步|
-|D21 环境和材料|9/21|待核验|确认测试应用、Redis、只读数据库、代码备份；冻结 Obsidian 清单|
+|D21 环境和材料|9/21|部分完成|Git 生产基线、ECS staging 用户/目录/venv/Redis/资源限额已实测；待测试飞书应用、只读数据库账号、模型凭据及 Obsidian 清单|
 |D22 多轮记忆和四类 Skills 模板|9/22 半天|待开始|先跑相关测试基线，定位清空入口；选定 3–5 个指标|
 |D23 路由—Skills—Tools—Output|9/23|待开始|M1–M9 最小闭环；23 号结束前准备 24 号可测版本|
 |D24 全量 Skills|9/24|待开始|22 指标、27 表和依赖规则；离线测试与远程黑盒测试|
@@ -25,6 +25,20 @@
 - 旧测试基线、已存在失败、模板响应时间基线；避免将原有问题误判为本轮引入。
 
 ## 每日记录模板
+
+### 2026-09-21 · D21
+
+- 今日目标 / 关联模块与测试：从实际生产目录冻结 Git 基线，建立本地开发目录和 ECS 隔离 staging 运行骨架。
+- 起始代码版本与环境：生产基线 `bd85212`，staging 配置提交 `68195bb`；Ubuntu 24.04，4 vCPU / 16 GiB，系统盘约 80 GiB。
+- 已完成代码 / 知识文件：本地目录 `/Users/shuoyang/北极星/ai-business-qa-bot-staging`；服务器目录 `/srv/ai-business-qa-bot-staging`；独立用户 `ai-bot-staging`；独立 venv；Redis `127.0.0.1:6380`；独立队列与 systemd 服务模板。
+- 隔离与预算：staging slice 合计上限 180% CPU、6 GiB 内存、256 tasks；1 个分析 worker、1 个文档 worker、1 个内部查询并发、DB pool=1。
+- 测试命令、环境、通过/失败/跳过数量及结果位置：Python 编译通过；staging Redis `PING` 通过；`tests.test_queue_runtime` 19 项全部通过。从生产基线选取的扩展用例共 42 项，7 项失败、11 项报错，原因包括生产测试文件与实现版本不一致及未配置模型凭据，已作为起始基线问题记录。
+- 真实对数与飞书测试证据：未进行；staging receiver/worker 保持 disabled/inactive，不复用生产飞书应用。
+- 生产影响：生产 Redis 6379、MySQL、2 个分析 worker、1 个文档 worker 和 receiver 健康检查均通过。
+- 未完成事项、原因、影响和下一步：在 `/srv/ai-business-qa-bot-staging/config/.env` 填入测试飞书 App ID/Secret、独立只读 MySQL 账号和模型凭据；验证后启用 staging worker/receiver，再做飞书收发和真实取数。
+- 本日设计变更：原计划的 Mac mini 运行环境改为“本地独立开发目录 + 生产 ECS 内受限 staging”；功能验收范围不变。
+- 测试部署版本 / 回退方式：代码 `68195bb`；Bot 服务未启用。回退可停用 `ai-bot-staging-*` 及 `redis-ai-bot-staging`，不影响生产服务。
+- 下一天首先读取的文件与执行的任务：本文档、`flexible_query_implementation_guide.md` 和 `deploy/staging/README.md`；先完成 D21 端到端凭据验证，再进入 D22。
 
 ### YYYY-MM-DD · Dxx
 
