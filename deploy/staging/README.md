@@ -54,3 +54,15 @@ production services, or older releases.
 Dependency changes require preparing and validating a new release-specific
 virtual environment before the switch; do not silently upgrade unpinned packages
 during deployment. Old releases are removed only after an explicit review.
+
+Roll back to a retained revision with:
+
+```bash
+/srv/ai-business-qa-bot-staging/current/deploy/staging/rollback-release.sh \
+  <retained-git-revision>
+```
+
+For the first migration only, `legacy-app` selects the preserved pre-release
+`/srv/ai-business-qa-bot-staging/app` directory. The rollback script also uses
+an atomic link switch and restores the previous target if the selected version
+does not become active.
