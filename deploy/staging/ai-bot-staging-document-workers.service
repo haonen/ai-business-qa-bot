@@ -9,11 +9,11 @@ Type=simple
 User=ai-bot-staging
 Group=ai-bot-staging
 Slice=ai-bot-staging.slice
-WorkingDirectory=/srv/ai-business-qa-bot-staging/app
+WorkingDirectory=/srv/ai-business-qa-bot-staging/current
 EnvironmentFile=/srv/ai-business-qa-bot-staging/config/.env
 Environment=BOT_SESSION_BACKEND=redis
 Environment=BOT_WORKER_ROLE=document
-ExecStart=/srv/ai-business-qa-bot-staging/app/.venv/bin/python -m bot.worker_pool
+ExecStart=/srv/ai-business-qa-bot-staging/current/.venv/bin/python -m bot.worker_pool
 Restart=always
 RestartSec=5
 TimeoutStopSec=210
@@ -22,4 +22,3 @@ UMask=0077
 
 [Install]
 WantedBy=multi-user.target
-

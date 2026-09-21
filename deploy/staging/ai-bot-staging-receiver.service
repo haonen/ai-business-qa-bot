@@ -9,9 +9,9 @@ Type=simple
 User=ai-bot-staging
 Group=ai-bot-staging
 Slice=ai-bot-staging.slice
-WorkingDirectory=/srv/ai-business-qa-bot-staging/app
+WorkingDirectory=/srv/ai-business-qa-bot-staging/current
 EnvironmentFile=/srv/ai-business-qa-bot-staging/config/.env
-ExecStart=/srv/ai-business-qa-bot-staging/app/.venv/bin/python -m bot.main
+ExecStart=/srv/ai-business-qa-bot-staging/current/.venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
@@ -19,4 +19,3 @@ UMask=0077
 
 [Install]
 WantedBy=multi-user.target
-
