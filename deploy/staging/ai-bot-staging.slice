@@ -1,0 +1,10 @@
+[Unit]
+Description=Resource limits for AI Business QA Bot staging
+
+[Slice]
+CPUQuota=180%
+MemoryMax=6G
+TasksMax=256
+CPUWeight=100
+IOWeight=100
+

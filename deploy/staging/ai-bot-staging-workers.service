@@ -1,0 +1,25 @@
+[Unit]
+Description=AI Business QA Bot staging RQ worker
+After=network-online.target redis-ai-bot-staging.service
+Wants=network-online.target
+Requires=redis-ai-bot-staging.service
+
+[Service]
+Type=simple
+User=ai-bot-staging
+Group=ai-bot-staging
+Slice=ai-bot-staging.slice
+WorkingDirectory=/srv/ai-business-qa-bot-staging/app
+EnvironmentFile=/srv/ai-business-qa-bot-staging/config/.env
+Environment=BOT_SESSION_BACKEND=redis
+Environment=BOT_WORKER_ROLE=analysis
+ExecStart=/srv/ai-business-qa-bot-staging/app/.venv/bin/python -m bot.worker_pool
+Restart=always
+RestartSec=5
+TimeoutStopSec=330
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+

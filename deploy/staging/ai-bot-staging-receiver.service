@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Business QA Bot staging Feishu receiver
+After=network-online.target redis-ai-bot-staging.service ai-bot-staging-workers.service
+Wants=network-online.target
+Requires=redis-ai-bot-staging.service
+
+[Service]
+Type=simple
+User=ai-bot-staging
+Group=ai-bot-staging
+Slice=ai-bot-staging.slice
+WorkingDirectory=/srv/ai-business-qa-bot-staging/app
+EnvironmentFile=/srv/ai-business-qa-bot-staging/config/.env
+ExecStart=/srv/ai-business-qa-bot-staging/app/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+

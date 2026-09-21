@@ -1,0 +1,19 @@
+[Unit]
+Description=Redis for AI Business QA Bot staging
+After=network.target
+
+[Service]
+Type=notify
+User=ai-bot-staging
+Group=ai-bot-staging
+Slice=ai-bot-staging.slice
+ExecStart=/usr/bin/redis-server /srv/ai-business-qa-bot-staging/config/redis.conf --supervised systemd
+ExecStop=/usr/bin/redis-cli -p 6380 shutdown
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+
